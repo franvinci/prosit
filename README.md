@@ -31,7 +31,7 @@ parameters = simulator.SimulatorParameters(net, initial_marking, final_marking)
 parameters.discover_from_eventlog(log)
 
 # initialize simulation engine
-simulator_eng = simulator.SimulatorEngine(net, initial_marking, final_marking, parameters)
+simulator_eng = simulator.SimulatorEngine(parameters)
 # simulate event log
 sim_log = simulator_eng.apply(n_sim_traces, start_ts_simulation=log[0][0]['start:timestamp'])
 ```
