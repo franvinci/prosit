@@ -23,7 +23,7 @@ from pm4py.objects.log.importer.xes import importer as xes_importer
 
 # read input Event log and Petri net
 log = xes_importer.apply('data/logs/purchasing.xes')
-net, im, fm = pm4py.read_pnml("data/models/purchasing.pnml")
+net, initial_marking, final_marking = pm4py.read_pnml("data/models/purchasing.pnml")
 
 # initialize simulation parameters
 parameters = simulator.SimulatorParameters(net, initial_marking, final_marking)
