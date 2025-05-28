@@ -1,9 +1,9 @@
 import random
-from tqdm import tqdm
-import datetime
 import pandas as pd
-import multiprocessing as mp
 import math
+import heapq
+from datetime import datetime
+from tqdm import tqdm
 
 import pm4py
 from pm4py.objects.petri_net.obj import PetriNet, Marking
@@ -14,18 +14,20 @@ from cortado_core.lca_approach import add_trace_to_pt_language
 from prosit.discovery.cf_discovery import discover_weight_transitions
 from prosit.discovery.time_discovery import discover_execution_time_distributions, discover_arrival_time, discover_waiting_time
 from prosit.discovery.calendar_discovery import discover_res_calendars, discover_arrival_calendar
-from prosit.discovery.resource_discovery import discover_resource_acts_prob
+from prosit.discovery.resource_discovery import discover_resources_list, discover_resource_acts_prob
 from prosit.discovery.data_discovery import discover_attributes_distribution, return_label_data_attributes
 from prosit.discovery.online_discovery.cf_discovery import incremental_transition_weights_learning
 from prosit.discovery.online_discovery.time_discovery import incremental_execution_time_learning, incremental_model_arrival_learning, incremental_waiting_time_learning
 from prosit.utils.common_utils import (
     return_enabled_transitions, 
-    update_markings, 
+    update_current_marking, 
     return_fired_transition, 
+    count_concurrent_events,
     compute_transition_weights_from_model, 
-    add_minutes_with_calendar
+    add_minutes_with_calendar,
+    build_df_features
     )
-
+from prosit.utils.distribution_utils import sampling_from_dist
 
 
 class SimulatorParameters:
@@ -49,20 +51,21 @@ class SimulatorParameters:
         self.final_marking: Marking = final_marking
         self.net_transition_labels: list = list(set([t.label for t in net.transitions if t.label]))
 
-        self.mode_act_history: bool = False
         self.label_data_attributes: list = []
         self.label_data_attributes_categorical: list = []
         self.attribute_values_label_categorical: dict = dict()
-        self.distribution_data_attributes: dict = dict()
 
         self.transition_weights: dict = {t: 1 for t in list(self.net.transitions)}
-        self.resources: list = ['res']
-        self.calendars: dict = {'res': {wd: {h: True for h in range(24)} for wd in range(7)}}
+        self.resources: list = ['auto']
+        self.act_resource_prob: dict = {act: {"auto": 1} for act in self.net_transition_labels}
+        self.calendars: dict = {'auto': {wd: {h: True for h in range(24)} for wd in range(7)}}
         self.arrival_calendar: dict = {wd: {h: True for h in range(24)} for wd in range(7)}
 
-        self.execution_time_distributions: dict = {a: ('fixed', 1, 1, 1) for a in self.net_transition_labels}
-        self.arrival_time_distribution: tuple = ('fixed', 1, 1, 1)
-        self.waiting_time_distributions: dict = {'res': ('fixed', 1, 1, 1)}
+        self.execution_time_distributions: dict = {a: ('fixed', 1, 1, 1, 1) for a in self.net_transition_labels}
+        self.arrival_time_distribution: tuple = ('fixed', 1, 1, 1, 1)
+        self.waiting_time_distributions: dict = {'auto': ('fixed', 1, 1, 1, 1)}
+
+        self.rules_mode: bool = False
 
         self.online_discovery = None
         self.grace_period = grace_period
@@ -71,13 +74,18 @@ class SimulatorParameters:
     def discover_from_eventlog(
             self, 
             log: EventLog, 
-            max_depths_cv: list = range(1, 6),
-            mode_act_history: bool = True,
+            max_depth_tree: list = 3,
             verbose: bool = True
         ):
         """ Discovery Parameters from event log data """
+
+        if max_depth_tree < 1:
+            self.rules_mode = False
+            max_depth_cv = []
+        else:
+            self.rules_mode = True
+            max_depth_cv = range(1, max_depth_tree + 1)
         
-        self.mode_act_history = mode_act_history
         self.label_data_attributes, self.label_data_attributes_categorical = return_label_data_attributes(log)
         
         for a in self.label_data_attributes_categorical:
@@ -88,48 +96,61 @@ class SimulatorParameters:
                 print("Data attributes discovery...")
             self.distribution_data_attributes = discover_attributes_distribution(log, self.label_data_attributes)
 
+        if verbose:
+            print("Feature discovery...")
+            df_features = build_df_features(log, self.net, self.initial_marking, self.final_marking, self.net_transition_labels, self.label_data_attributes)
+
+        if verbose:
+            print("Transition probabilities discovery...")
         self.transition_weights = discover_weight_transitions(
-                                                                log, 
-                                                                self.net, self.initial_marking, self.final_marking, 
+                                                                df_features, 
                                                                 self.net_transition_labels, 
-                                                                max_depths_cv=max_depths_cv,                  
+                                                                max_depths_cv=max_depth_cv,                  
                                                                 label_data_attributes=self.label_data_attributes, 
                                                                 label_data_attributes_categorical=self.label_data_attributes_categorical, 
-                                                                values_categorical=self.attribute_values_label_categorical,
-                                                                mode_act_history=mode_act_history,
-                                                                verbose=verbose
+                                                                values_categorical=self.attribute_values_label_categorical
                                                             )
 
         if verbose:
+            print("Resources discovery...")
+        self.resources = discover_resources_list(log)
+        self.act_resource_prob = discover_resource_acts_prob(log, self.resources)
+        df_features = df_features[df_features['resource'].isin(self.resources)]
+        df_features.reset_index(drop=True, inplace=True)
+
+        if verbose:
             print("Calendars discovery...")
-        self.calendars = discover_res_calendars(log)
+        self.calendars = discover_res_calendars(log, self.resources)
         self.arrival_calendar = discover_arrival_calendar(log)
 
         if verbose:
-            print("Resources discovery...")
-        self.resources = list(pm4py.get_event_attribute_values(log, 'org:resource').keys())
-        self.act_resource_prob = discover_resource_acts_prob(log)
-
-
+            print("Execution Time discovery...")
         self.execution_time_distributions = discover_execution_time_distributions(
-                                                                                    log, self.net_transition_labels, self.calendars, 
-                                                                                    max_depths=max_depths_cv,
+                                                                                    df_features,
+                                                                                    self.net_transition_labels,
+                                                                                    self.resources,
+                                                                                    self.calendars, 
+                                                                                    max_depths=max_depth_cv,
                                                                                     label_data_attributes=self.label_data_attributes, 
                                                                                     label_data_attributes_categorical=self.label_data_attributes_categorical, 
-                                                                                    values_categorical=self.attribute_values_label_categorical,
-                                                                                    mode_act_history=mode_act_history
+                                                                                    values_categorical=self.attribute_values_label_categorical
                                                                                 )
-        
-        self.arrival_time_distribution = discover_arrival_time(log, self.arrival_calendar, max_depths=max_depths_cv)
-
+        if verbose:
+            print("Waiting Time discovery...")
         self.waiting_time_distributions = discover_waiting_time(
-                                                                    log, 
+                                                                    df_features,
+                                                                    self.net_transition_labels,
+                                                                    self.resources, 
                                                                     self.calendars, 
                                                                     self.label_data_attributes, 
                                                                     self.label_data_attributes_categorical, 
                                                                     self.attribute_values_label_categorical, 
-                                                                    max_depths=max_depths_cv
+                                                                    max_depths=max_depth_cv
                                                                 )
+        
+        if verbose:
+            print("Arrival Time discovery...")
+        self.arrival_time_distribution = discover_arrival_time(log, self.arrival_calendar, max_depths=max_depth_cv)
         
 
     def _firststep_incremental_discovery(
@@ -348,327 +369,190 @@ class SimulatorEngine:
         self.initial_marking = simulation_parameters.initial_marking
         self.final_marking = simulation_parameters.final_marking
         self.simulation_parameters = simulation_parameters
-        self.case_id = 1
-        self.current_timestamp = None
 
 
-    def _generate_activities(self, x_attr=[]):
-        """ Generate Activity Traces """
+    def apply(self, n_traces: int = 1, t_start: datetime = datetime.now()) -> pd.DataFrame:
 
-        trace = []
-        trace_attributes = dict()
-        for i, l in enumerate(self.simulation_parameters.label_data_attributes):
-            trace_attributes[l] = x_attr[i]
+        event_log = []
+        enabled_heap = []
+        resource_schedule = {r: [] for r in self.simulation_parameters.resources}
+        cases = []
 
-        tkns = list(self.initial_marking)
-        enabled_transitions = return_enabled_transitions(self.net, tkns)
+        if not self.simulation_parameters.rules_mode:
+            sampled_arrivals = sampling_from_dist(*self.simulation_parameters.arrival_time_distribution, n_sample=n_traces)
+            sampled_waiting_times = {res : sampling_from_dist(*self.simulation_parameters.waiting_time_distributions[res], n_sample=n_traces) for res in self.simulation_parameters.resources}
+            sampled_execution_times = {act: sampling_from_dist(*self.simulation_parameters.execution_time_distributions[act], n_sample=n_traces) for act in self.simulation_parameters.net_transition_labels}
 
-        if self.simulation_parameters.mode_act_history:
-            x_history = {t_l: 0 for t_l in self.simulation_parameters.net_transition_labels}
-            X = x_attr + list(x_history.values())
+        if self.simulation_parameters.label_data_attributes:
+            x_attr_list = random.choices(
+                list(self.simulation_parameters.distribution_data_attributes.keys()), 
+                weights=list(self.simulation_parameters.distribution_data_attributes.values()),
+                k = n_traces
+                )
+            x_attr_list = [list(attr) for attr in x_attr_list]
         else:
-            X = x_attr
+            x_attr_list = [[]]*n_traces
 
-        if not X:
-            transition_weights = self.simulation_parameters.transition_weights
-        else:
-            dict_x = dict(zip(self.simulation_parameters.label_data_attributes + self.simulation_parameters.net_transition_labels, X))
-            for a in self.simulation_parameters.label_data_attributes_categorical:
-                for v in self.simulation_parameters.attribute_values_label_categorical[a]:
-                    dict_x[a+' = '+str(v)] = (dict_x[a] == v)*1
-                del dict_x[a]
-            transition_weights = compute_transition_weights_from_model(self.simulation_parameters.transition_weights, dict_x)
-        
-        t_fired = return_fired_transition(transition_weights, enabled_transitions)
-        if t_fired.label:
-            trace.append(t_fired.label)
+        current_arr_ts = t_start
 
-        tkns = update_markings(tkns, t_fired)
-        while set(tkns) != set(self.final_marking):
-            if t_fired.label:
-                if self.simulation_parameters.mode_act_history:
-                    dict_x[t_fired.label] += 1
-            transition_weights = compute_transition_weights_from_model(self.simulation_parameters.transition_weights, dict_x)
-            enabled_transitions = return_enabled_transitions(self.net, tkns)
-            t_fired = return_fired_transition(transition_weights, enabled_transitions)
-            if t_fired.label:
-                trace.append(t_fired.label)
-            tkns = update_markings(tkns, t_fired)
+        for i in range(n_traces):
 
-        return trace, trace_attributes
-
-
-    def _generate_events(self, curr_traces_acts, start_ts_simulation, curr_trace_attributes=[]) -> pd.DataFrame:
-
-        n_sim = len(curr_traces_acts)
-
-        current_arr_ts = start_ts_simulation
-
-        arrival_timestamps = dict()
-        for id in range(self.case_id, self.case_id+n_sim):
-            arrival_timestamps[f'case_{id}'] = current_arr_ts.timestamp()
-            if self.simulation_parameters.online_discovery:
-                arrival_pred = self.simulation_parameters.arrival_time_distribution.debug_one({
-                                                                                                        'hour': current_arr_ts.hour,
-                                                                                                        'weekday': current_arr_ts.weekday()
-                                                                                                    })
-                if not arrival_pred:
-                    arrival_delta = self.simulation_parameters.arrival_time_distribution.predict_one({
-                                                                                                        'hour': current_arr_ts.hour,
-                                                                                                        'weekday': current_arr_ts.weekday()
-                                                                                                    })
-                else:
-                    pred_split = arrival_pred.split("\n")[-2].split(" | ")
-                    mean = float(pred_split[0][6:].replace(",", ""))
-                    var = float(pred_split[1][5:].replace(",", ""))
-                    # arrival_delta = random.expovariate(1/arrival_pred)
-                    arrival_delta = random.normalvariate(mean, math.sqrt(var))
-                    if arrival_delta < self.simulation_parameters.min_at:
-                        arrival_delta = mean
-                    elif arrival_delta > self.simulation_parameters.max_at:
-                        arrival_delta = mean
-            else:   
-                arrival_delta = self.simulation_parameters.arrival_time_distribution.apply_distribution({
-                                                                                                            'hour': current_arr_ts.hour,
-                                                                                                            'weekday': current_arr_ts.weekday()
-                                                                                                        })
-            current_arr_ts = add_minutes_with_calendar(current_arr_ts, int(arrival_delta), self.simulation_parameters.arrival_calendar)
-
-        flag_active_cases = {f'case_{id}': False for id in range(self.case_id, self.case_id+n_sim)}
-
-        if self.simulation_parameters.mode_act_history:
-            hystory_active_traces = {
-                                        f'case_{id}': {l: 0 for l in self.simulation_parameters.net_transition_labels} 
-                                        for id in range(self.case_id, self.case_id+n_sim)
-                                    }
-        events = []
-
-        curr_trace_attribute_features = dict()
-        if curr_trace_attributes:
-            for case_id in curr_trace_attributes.keys():
-                curr_trace_attribute_features[case_id] = dict()
-                for a in self.simulation_parameters.label_data_attributes:
+            trace_attributes = dict()
+            if x_attr_list[i]:
+                for j, a in enumerate(self.simulation_parameters.label_data_attributes):
                     if a in self.simulation_parameters.label_data_attributes_categorical:
                         for v in self.simulation_parameters.attribute_values_label_categorical[a]:
-                            curr_trace_attribute_features[case_id][a+' = '+str(v)] = (curr_trace_attributes[case_id][a] == v)*1
+                            trace_attributes[a+' = '+str(v)] = int(x_attr_list[i][j] == v)
                     else:
-                        curr_trace_attribute_features[case_id][a] = curr_trace_attributes[case_id][a]
+                        trace_attributes[a] = x_attr_list[i][j]
+                
+            else:
+                trace_attributes = dict()
 
-        while len(curr_traces_acts) > 0:
+            if not self.simulation_parameters.rules_mode:
+                arrival_delta = sampled_arrivals[i]
+            else:
+                if self.simulation_parameters.online_discovery:
+                    arrival_pred = self.simulation_parameters.arrival_time_distribution.debug_one({'hour': current_arr_ts.hour,'weekday': current_arr_ts.weekday()})
+                    if not arrival_pred:
+                        arrival_delta = self.simulation_parameters.arrival_time_distribution.predict_one({'hour': current_arr_ts.hour,'weekday': current_arr_ts.weekday()})
+                    else:
+                        pred_split = arrival_pred.split("\n")[-2].split(" | ")
+                        mean = float(pred_split[0][6:].replace(",", ""))
+                        var = float(pred_split[1][5:].replace(",", ""))
+                        arrival_delta = random.normalvariate(mean, math.sqrt(var))
+                        if arrival_delta < self.simulation_parameters.min_at:
+                            arrival_delta = mean
+                        elif arrival_delta > self.simulation_parameters.max_at:
+                            arrival_delta = mean
+                else:   
+                    arrival_delta = self.simulation_parameters.arrival_time_distribution.apply_distribution({'hour': current_arr_ts.hour,'weekday': current_arr_ts.weekday()})
+            current_arr_ts = add_minutes_with_calendar(current_arr_ts, int(arrival_delta), self.simulation_parameters.arrival_calendar)
 
-            curr_case_id = min(arrival_timestamps, key=arrival_timestamps.get)
-            current_ts = arrival_timestamps[curr_case_id]
+            case = {
+                "case_id": i,
+                "marking": self.initial_marking,
+                "arrival_time": current_arr_ts,
+                "place_token_time": {},
+                "enabled": {},
+                "history": {t: 0 for t in self.simulation_parameters.net_transition_labels},
+                "attributes": trace_attributes
+            }
+            for place in self.net.places:
+                case["place_token_time"][place] = None
+            case["place_token_time"][list(self.initial_marking.keys())[0]] = case["arrival_time"]
 
-            if len(curr_traces_acts[curr_case_id]) < 1:
-                del curr_traces_acts[curr_case_id]
-                if self.simulation_parameters.mode_act_history:
-                    del hystory_active_traces[curr_case_id]
-                del arrival_timestamps[curr_case_id]
-                del curr_trace_attribute_features[curr_case_id]
-                del curr_trace_attributes[curr_case_id]
+            enabled = return_enabled_transitions(self.net, case["marking"])
+            for t in enabled:
+                input_places = [arc.source for arc in self.net.arcs if arc.target == t]
+                enabled_time = max(case["place_token_time"][p] for p in input_places)
+                case["enabled"][t] = enabled_time
+
+            if case["enabled"]:
+                enabled_time_case = min(case["enabled"].values())
+                heapq.heappush(enabled_heap, (enabled_time_case, i))
+
+            cases.append(case)
+
+        completed_cases = set()
+        pbar = tqdm(total=n_traces, desc="Simulating Cases")
+        while enabled_heap:
+            _, case_id = heapq.heappop(enabled_heap)
+            case = cases[case_id]
+
+            if not case["enabled"]:
                 continue
 
-            curr_act = curr_traces_acts[curr_case_id].pop(0)
-
-            curr_res = random.choices(
-                                        list(self.simulation_parameters.act_resource_prob[curr_act].keys()), 
-                                        weights=list(self.simulation_parameters.act_resource_prob[curr_act].values())
-                                    )[0]
-
-            n_active = 0
-            if len(events) > 0:
-                for e in events:
-                    if e['org:resource'] != curr_res:
-                        continue
-                    if e['time:timestamp'] > current_ts and e['start:timestamp'] < current_ts:
-                        n_active += 1
-
-            current_ts_datetime = datetime.datetime.fromtimestamp(current_ts)
-
-            if not flag_active_cases[curr_case_id]:
-                waiting_time = 0
-                flag_active_cases[curr_case_id] = True
+            enabled_transitions = list(case["enabled"].keys())
+            if not self.simulation_parameters.rules_mode:
+                transition_weights = self.simulation_parameters.transition_weights
             else:
-                n_running_events = n_active
-                if curr_res in self.simulation_parameters.waiting_time_distributions.keys():
-                    if sum(hystory_active_traces[curr_case_id].values()) == 0:
+                transition_weights = compute_transition_weights_from_model(self.simulation_parameters.transition_weights, case["attributes"] | case["history"])
+            chosen_transition = return_fired_transition(transition_weights, enabled_transitions)
+            activity = chosen_transition.label
+            t_enabled = case["enabled"][chosen_transition]
+
+            if activity is not None:
+                resources = list(self.simulation_parameters.act_resource_prob[activity].keys())
+                resource_weights = list(self.simulation_parameters.act_resource_prob[activity].values())
+                resource = random.choices(resources, weights=resource_weights, k=1)[0]
+                r_workload = count_concurrent_events(resource_schedule[resource], t_enabled)
+                
+                if sum(case["history"].values()) == 0:
                         waiting_time = 0
+                else:
+                    if not self.simulation_parameters.rules_mode:
+                        waiting_time = random.choice(sampled_waiting_times[resource])
                     else:
                         if self.simulation_parameters.online_discovery:
-                            waiting_time_pred = self.simulation_parameters.waiting_time_distributions[curr_res].debug_one(
-                                                                                                                            {
-                                                                                                                                'hour': current_ts_datetime.hour, 
-                                                                                                                                'weekday': current_ts_datetime.weekday(), 
-                                                                                                                                'n. running events': n_running_events
-                                                                                                                            } | curr_trace_attribute_features[curr_case_id]
-                                                                                                                        )
+                            waiting_time_pred = self.simulation_parameters.waiting_time_distributions[resource].debug_one({'workload': r_workload} | case["history"] | case["attributes"])
                             if not waiting_time_pred:
-                                waiting_time = self.simulation_parameters.waiting_time_distributions[curr_res].predict_one(
-                                                                                                                            {
-                                                                                                                                'hour': current_ts_datetime.hour, 
-                                                                                                                                'weekday': current_ts_datetime.weekday(), 
-                                                                                                                                'n. running events': n_running_events
-                                                                                                                            } | curr_trace_attribute_features[curr_case_id]
-                                                                                                                        )
+                                waiting_time = self.simulation_parameters.waiting_time_distributions[resource].predict_one({'workload': r_workload} | case["history"] | case["attributes"])
                             else:
                                 pred_split = waiting_time_pred.split("\n")[-2].split(" | ")
                                 mean = float(pred_split[0][6:].replace(",", ""))
                                 var = float(pred_split[1][5:].replace(",", ""))
                                 waiting_time = random.normalvariate(mean, math.sqrt(var))
-                                if waiting_time < self.simulation_parameters.min_wt[curr_res]:
+                                if waiting_time < self.simulation_parameters.min_wt[resource]:
                                     waiting_time = mean
-                                elif waiting_time > self.simulation_parameters.max_wt[curr_res]:
+                                elif waiting_time > self.simulation_parameters.max_wt[resource]:
                                     waiting_time = mean
                         else:
-                            waiting_time = self.simulation_parameters.waiting_time_distributions[curr_res].apply_distribution(
-                                                                                                                                {
-                                                                                                                                    'hour': current_ts_datetime.hour, 
-                                                                                                                                    'weekday': current_ts_datetime.weekday(), 
-                                                                                                                                    'n. running events': n_running_events
-                                                                                                                                } | curr_trace_attribute_features[curr_case_id]
-                                                                                                                            )
+                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply_distribution({'workload': r_workload} | case["history"] | case["attributes"])
+
+                if not self.simulation_parameters.rules_mode:
+                    ex_time = random.choice(sampled_execution_times[activity])
                 else:
-                    waiting_time = 0
-
-            start_ts_datetime = add_minutes_with_calendar(current_ts_datetime, int(waiting_time), self.simulation_parameters.calendars[curr_res])
-            start_ts = start_ts_datetime.timestamp()
-
-
-            if self.simulation_parameters.mode_act_history:
-                if self.simulation_parameters.online_discovery:
-                    ex_time_pred = self.simulation_parameters.execution_time_distributions[curr_act].debug_one(
-                                                                                                                {'resource = '+res: (res == curr_res)*1 for res in self.simulation_parameters.resources} | 
-                                                                                                                hystory_active_traces[curr_case_id] | 
-                                                                                                                curr_trace_attribute_features[curr_case_id] | 
-                                                                                                                {'hour': start_ts_datetime.hour, 'weekday': start_ts_datetime.weekday()}
-                                                                                                            )
-                    if not ex_time_pred:
-                        ex_time = self.simulation_parameters.execution_time_distributions[curr_act].predict_one(
-                                                                                                                {'resource = '+res: (res == curr_res)*1 for res in self.simulation_parameters.resources} | 
-                                                                                                                hystory_active_traces[curr_case_id] | 
-                                                                                                                curr_trace_attribute_features[curr_case_id] | 
-                                                                                                                {'hour': start_ts_datetime.hour, 'weekday': start_ts_datetime.weekday()}
-                                                                                                            )
+                    if self.simulation_parameters.online_discovery:
+                        ex_time_pred = self.simulation_parameters.execution_time_distributions[activity].debug_one({'resource = '+res: (res == resource)*1 for res in self.simulation_parameters.resources} | case["history"] | case["attributes"])
+                        if not ex_time_pred:
+                            ex_time = self.simulation_parameters.execution_time_distributions[activity].predict_one({'resource = '+res: (res == resource)*1 for res in self.simulation_parameters.resources} | case["history"] | case["attributes"])
+                        else:
+                            pred_split = ex_time_pred.split("\n")[-2].split(" | ")
+                            mean = float(pred_split[0][6:].replace(",", ""))
+                            var = float(pred_split[1][5:].replace(",", ""))
+                            ex_time = random.normalvariate(mean, math.sqrt(var))
+                            if ex_time < self.simulation_parameters.min_et[activity]:
+                                ex_time = mean
+                            elif ex_time > self.simulation_parameters.max_et[activity]:
+                                ex_time = mean         
                     else:
-                        pred_split = ex_time_pred.split("\n")[-2].split(" | ")
-                        mean = float(pred_split[0][6:].replace(",", ""))
-                        var = float(pred_split[1][5:].replace(",", ""))
-                        ex_time = random.normalvariate(mean, math.sqrt(var))
-                        if ex_time < self.simulation_parameters.min_et[curr_act]:
-                            ex_time = mean
-                        elif ex_time > self.simulation_parameters.max_et[curr_act]:
-                            ex_time = mean         
-                else:
-                    ex_time = self.simulation_parameters.execution_time_distributions[curr_act].apply_distribution(
-                                                                                                                    {'resource = '+res: (res == curr_res)*1 for res in self.simulation_parameters.resources} | 
-                                                                                                                    hystory_active_traces[curr_case_id] | 
-                                                                                                                    curr_trace_attribute_features[curr_case_id] | 
-                                                                                                                    {'hour': start_ts_datetime.hour, 'weekday': start_ts_datetime.weekday()}
-                                                                                                                )
+                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply_distribution({'resource = '+res: (res == resource)*1 for res in self.simulation_parameters.resources} | case["history"] | case["attributes"])
+
+                
+                t_start_exec = add_minutes_with_calendar(t_enabled, int(waiting_time), self.simulation_parameters.calendars[resource])
+                t_end = add_minutes_with_calendar(t_start_exec, int(ex_time), self.simulation_parameters.calendars[resource])
+
+                event_log.append((case_id, activity, resource, t_enabled, t_start_exec, t_end) + tuple(x_attr_list[case_id]))
+                resource_schedule[resource].append((t_start_exec, t_end))
+                case["history"][activity] += 1
             else:
-                if self.simulation_parameters.online_discovery:
-                    ex_time_pred = self.simulation_parameters.execution_time_distributions[curr_act].debug_one(
-                                                                                                                {res: (res == curr_res)*1 for res in self.simulation_parameters.resources} | 
-                                                                                                                curr_trace_attribute_features[curr_case_id] | 
-                                                                                                                {'hour': start_ts_datetime.hour, 'weekday': start_ts_datetime.weekday()}
-                                                                                                            )
-                    if not ex_time_pred:
-                        ex_time = self.simulation_parameters.execution_time_distributions[curr_act].predict_one(
-                                                                                                                {res: (res == curr_res)*1 for res in self.simulation_parameters.resources} | 
-                                                                                                                curr_trace_attribute_features[curr_case_id] | 
-                                                                                                                {'hour': start_ts_datetime.hour, 'weekday': start_ts_datetime.weekday()}
-                                                                                                            )
-                    else:
-                        pred_split = ex_time_pred.split("\n")[-2].split(" | ")
-                        mean = float(pred_split[0][6:].replace(",", ""))
-                        var = float(pred_split[1][5:].replace(",", ""))
-                        ex_time = random.normalvariate(mean, math.sqrt(var))
-                        if ex_time < self.simulation_parameters.min_et[curr_act]:
-                            ex_time = mean
-                        elif ex_time > self.simulation_parameters.max_et[curr_act]:
-                            ex_time = mean
-                else:
-                    ex_time = self.simulation_parameters.execution_time_distributions[curr_act].apply_distribution(
-                                                                                                                    {res: (res == curr_res)*1 for res in self.simulation_parameters.resources} | 
-                                                                                                                    curr_trace_attribute_features[curr_case_id] | 
-                                                                                                                    {'hour': start_ts_datetime.hour, 'weekday': start_ts_datetime.weekday()}
-                                                                                                                )
-            
-            end_ts_datetime = add_minutes_with_calendar(start_ts_datetime, int(ex_time), self.simulation_parameters.calendars[curr_res])
-            end_ts = end_ts_datetime.timestamp()
-            arrival_timestamps[curr_case_id] = end_ts
+                t_end = t_enabled
 
+            for arc in chosen_transition.out_arcs:
+                case["place_token_time"][arc.target] = t_end
 
-            events.append(
-                            {
-                                'case:concept:name': curr_case_id, 
-                                'concept:name': curr_act, 
-                                'start:timestamp': start_ts, 
-                                'time:timestamp': end_ts, 
-                                'org:resource': curr_res
-                            } | {a: curr_trace_attributes[curr_case_id][a] for a in self.simulation_parameters.label_data_attributes}
-                        )
+            case["enabled"] = {}
+            case["marking"] = update_current_marking(case["marking"], chosen_transition)
+            if case["marking"] == self.final_marking:
+                if case_id not in completed_cases:
+                    pbar.update(1)
+                    completed_cases.add(case_id)
+                continue
+            enabled = return_enabled_transitions(self.net, case["marking"])
+            for t in enabled:
+                input_places = [arc.source for arc in self.net.arcs if arc.target == t]
+                enabled_time = max(case["place_token_time"][p] for p in input_places)
+                case["enabled"][t] = enabled_time
 
-            if self.simulation_parameters.mode_act_history:
-                hystory_active_traces[curr_case_id][curr_act] += 1
-            if len(curr_traces_acts[curr_case_id]) < 1:
-                del curr_traces_acts[curr_case_id]
-                if self.simulation_parameters.mode_act_history:
-                    del hystory_active_traces[curr_case_id]
-                del arrival_timestamps[curr_case_id]
-                del curr_trace_attribute_features[curr_case_id]
-                del curr_trace_attributes[curr_case_id]
+            if case["enabled"]:
+                next_enabled_time = min(case["enabled"].values())
+                heapq.heappush(enabled_heap, (next_enabled_time, case_id))
 
-        df_events_sim = pd.DataFrame(events)
-        df_events_sim['start:timestamp'] = df_events_sim['start:timestamp'].apply(lambda x: datetime.datetime.fromtimestamp(x))
-        df_events_sim['time:timestamp'] = df_events_sim['time:timestamp'].apply(lambda x: datetime.datetime.fromtimestamp(x))
+        pbar.close()
+        df_log = pd.DataFrame(event_log, columns=["case:concept:name", "concept:name", "org:resource", "enabled:timestamp", "start:timestamp", "time:timestamp"] + self.simulation_parameters.label_data_attributes)
+        df_log["case:concept:name"] = df_log["case:concept:name"].apply(lambda x: f"case_{x+1}")
+        df_log.sort_values(by=["start:timestamp", "time:timestamp"], inplace=True)
+        df_log.reset_index(drop=True, inplace=True)
 
-        self.current_timestamp = datetime.datetime.fromtimestamp(end_ts)
-
-        return df_events_sim
-
-
-    def apply_trace(self, start_ts_simulation=None, x_attr=[])-> pd.DataFrame:
-
-        trace_acts, trace_attributes = self._generate_activities(x_attr)
-        curr_traces_acts = {f'case_{self.case_id}': trace_acts}
-        if start_ts_simulation:
-            self.current_timestamp = start_ts_simulation
-        sim_trace_df = self._generate_events(curr_traces_acts, self.current_timestamp, {f'case_{self.case_id}': trace_attributes})
-
-        return sim_trace_df
-
-
-    def apply(self, n_sim: int, start_ts_simulation: pd.Timestamp, multiprocessing_cf: bool = True) -> pd.DataFrame:
-
-        num_cores = mp.cpu_count()
-        if self.simulation_parameters.label_data_attributes:
-            x_attr_list = random.choices(
-                list(self.simulation_parameters.distribution_data_attributes.keys()), 
-                weights=list(self.simulation_parameters.distribution_data_attributes.values()),
-                k = n_sim
-                )
-            x_attr_list = [list(attr) for attr in x_attr_list]
-        else:
-            x_attr_list = [[]]*n_sim
-
-        if multiprocessing_cf:
-            with mp.Pool(processes=num_cores) as pool:
-                traces_acts_attributes = pool.map(self._generate_activities, tqdm(x_attr_list, desc="Processing"))
-        else:
-            traces_acts_attributes = []
-            for i in tqdm(range(n_sim)):
-                trace_act = self._generate_activities(x_attr_list[i])
-                traces_acts_attributes.append(trace_act)
-
-        curr_traces_acts = dict()
-        curr_trace_attributes = dict()
-        for j, id in enumerate(range(self.case_id, self.case_id+n_sim)):
-            curr_traces_acts[f'case_{id}'] = traces_acts_attributes[j][0]
-            curr_trace_attributes[f'case_{id}'] = traces_acts_attributes[j][1]
-
-        sim_log_df = self._generate_events(curr_traces_acts, start_ts_simulation, curr_trace_attributes)
-
-        self.case_id += n_sim
-
-        return sim_log_df
+        return df_log

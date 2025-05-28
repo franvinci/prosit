@@ -26,7 +26,7 @@ def return_label_data_attributes(log: EventLog) -> tuple:
     label_data_attributes = list(set(df_log.columns) - standard_xes_columns)
     label_data_attributes_categorical = []
     for l in label_data_attributes:
-        if df_log[l].dtype != float:
+        if type(df_log[l].iloc[0]) == str:
             label_data_attributes_categorical.append(l)
     
     return label_data_attributes, label_data_attributes_categorical

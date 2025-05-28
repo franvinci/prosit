@@ -30,7 +30,10 @@ def return_best_distribution(data: any, dist_search: list = ['fixed', 'norm', 'e
     dict_wass = dict()
 
     if len(set(data)) == 1:
-        return 'fixed', data.iloc[0]
+        if type(data) == list:
+            return 'fixed', data[0]
+        else:
+            return 'fixed', data.iloc[0]
 
     for dist_name in dist_search:
 

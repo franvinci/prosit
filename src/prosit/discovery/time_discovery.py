@@ -1,18 +1,19 @@
 import numpy as np
-import datetime
 from tqdm import tqdm
 import pandas as pd
+import pm4py
 
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.model_selection import GridSearchCV
 
-import pm4py
 from pm4py.objects.log.obj import EventLog
 
 from prosit.utils.common_utils import count_false_hours
 from prosit.utils.distribution_utils import return_best_distribution, sampling_from_dist
 from prosit.utils.rule_utils import DecisionRules
 
+
+DIST_SEARCH = ['fixed', 'norm', 'expon', 'lognorm', 'uniform']
 
 
 # DISCOVERY
@@ -23,42 +24,48 @@ def discover_arrival_time(
         max_depths: list = range(1,6)
     ) -> DecisionRules:
 
-    print("Arrival Time discovery...")
-    arrival_time_distr = build_model_arrival(log, calendar_arrival, max_depths)
+    if not max_depths:
+        arrival_time_distr = find_best_distribution_arrival(log, calendar_arrival)
+    else:
+        arrival_time_distr = build_model_arrival(log, calendar_arrival, max_depths)
 
     return arrival_time_distr
 
 
 
 def discover_execution_time_distributions(
-        log: EventLog, 
-        net_transition_labels: list, 
+        df_features: pd.DataFrame, 
+        net_transition_labels: list,
+        resources: list, 
         calendars: dict, 
         max_depths: list = range(1,6),
         label_data_attributes: list = [], 
         label_data_attributes_categorical: list = [], 
         values_categorical: dict = dict(),
-        mode_act_history: bool = True
     ) -> dict:
 
-    print("Execution Time discovery...")
-    activity_exec_time_distributions = build_models_ex(
-                                                        log, 
-                                                        net_transition_labels, 
-                                                        calendars,
-                                                        label_data_attributes, 
-                                                        label_data_attributes_categorical, 
-                                                        values_categorical,
-                                                        mode_act_history, 
-                                                        max_depths
-                                                    )
+    if not max_depths:
+        activity_exec_time_distributions = find_best_distribution_ex(df_features, net_transition_labels, calendars)
+    else:
+        activity_exec_time_distributions = build_models_ex(
+                                                            df_features, 
+                                                            net_transition_labels,
+                                                            resources,
+                                                            calendars,
+                                                            label_data_attributes, 
+                                                            label_data_attributes_categorical, 
+                                                            values_categorical, 
+                                                            max_depths
+                                                        )
 
     return activity_exec_time_distributions
 
 
 
 def discover_waiting_time(
-        log: EventLog, 
+        df_features: pd.DataFrame,
+        net_transition_labels: list, 
+        resources: list,
         calendars: dict, 
         label_data_attributes: list, 
         label_data_attributes_categorical: list, 
@@ -66,17 +73,21 @@ def discover_waiting_time(
         max_depths: list = range(1,6)
     ) -> dict:
 
-    print("Waiting Time discovery...")
-    role_waiting_time_distributions = build_models_wt(
-                                                        log, 
-                                                        calendars, 
-                                                        label_data_attributes, 
-                                                        label_data_attributes_categorical, 
-                                                        values_categorical, 
-                                                        max_depths
-                                                    )
+    if not max_depths:
+        res_waiting_time_distributions = find_best_distribution_wt(df_features, resources, calendars)
+    else:
+        res_waiting_time_distributions = build_models_wt(
+                                                            df_features, 
+                                                            net_transition_labels,
+                                                            resources,
+                                                            calendars, 
+                                                            label_data_attributes, 
+                                                            label_data_attributes_categorical, 
+                                                            values_categorical, 
+                                                            max_depths
+                                                        )
 
-    return role_waiting_time_distributions
+    return res_waiting_time_distributions
 
 
 
@@ -120,10 +131,10 @@ def build_model_arrival(
     leaves = list(y_leaf['Leaf'].unique())
     for l in leaves:
         y = y_leaf[y_leaf['Leaf']==l]['Y']
-        dist, params = return_best_distribution(y, dist_search=["norm"])
-        max_value = int(max(y))
+        dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
+        max_value = int(np.quantile(y, 0.95))
         min_value = int(min(y))
-        sampled = sampling_from_dist(dist, params, min_value, max_value, np.mean(y))
+        sampled = sampling_from_dist(dist, params, min_value, max_value, np.median(y), n_sample=max(len(y), 1000))
         clf.rules[l]['dist'] = dist, params
         clf.rules[l]['sampled'] = list(sampled)
 
@@ -132,24 +143,24 @@ def build_model_arrival(
 
 
 def build_models_ex(
-        log: EventLog, 
-        activity_labels: list, 
+        df_features: pd.DataFrame, 
+        activity_labels: list,
+        resources: list,
         calendars: dict,
         label_data_attributes: list, 
         label_data_attributes_categorical: list, 
         values_categorical: dict, 
-        mode_act_history: bool, 
         max_depths: list = range(1,6)
     ) -> dict:
 
     df = build_training_df_ex(
-                                log, 
+                                df_features,
+                                resources, 
                                 activity_labels, 
                                 calendars,
                                 label_data_attributes, 
                                 label_data_attributes_categorical, 
-                                values_categorical, 
-                                mode_act_history
+                                values_categorical
                             )
     
     param_grid = {'max_depth': max_depths}
@@ -187,10 +198,10 @@ def build_models_ex(
         leaves = list(y_leaf['Leaf'].unique())
         for l in leaves:
             y = y_leaf[y_leaf['Leaf']==l]['Y']
-            dist, params = return_best_distribution(y, dist_search=["norm"])
-            max_value = int(max(y))
+            dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
+            max_value = int(np.quantile(y, 0.95))
             min_value = int(min(y))
-            sampled = sampling_from_dist(dist, params, min_value, max_value, np.mean(y))
+            sampled = sampling_from_dist(dist, params, min_value, max_value, np.median(y), n_sample=max(len(y), 1000))
             clf.rules[l]['dist'] = dist, params
             clf.rules[l]['sampled'] = list(sampled)
 
@@ -201,7 +212,9 @@ def build_models_ex(
 
 
 def build_models_wt(
-        log: EventLog, 
+        df_features: pd.DataFrame, 
+        activity_labels: list,
+        resources: list,
         calendars: dict, 
         label_data_attributes: list, 
         label_data_attributes_categorical: list, 
@@ -209,21 +222,20 @@ def build_models_wt(
         max_depths: list = range(1,6)
     ) -> dict:
 
-    resources = list(pm4py.get_event_attribute_values(log, 'org:resource').keys())
-    df_per_res = build_training_df_wt(log, calendars, label_data_attributes)
+    df = build_training_df_wt(
+                                df_features,
+                                activity_labels,
+                                calendars, 
+                                label_data_attributes,
+                                label_data_attributes_categorical,
+                                values_categorical
+                            )       
 
     param_grid = {'max_depth': max_depths}
 
     models_res = dict()
     for res in tqdm(resources):
-        df_res = df_per_res[res]
-        if len(df_res) <1:
-            continue
-
-        for a in label_data_attributes_categorical:
-            for v in values_categorical[a]:
-                df_res[a+' = '+str(v)] = (df_res[a] == v)*1
-            del df_res[a]
+        df_res = df[df['resource'] == res].iloc[:,1:]
 
         X = df_res.drop(columns=['waiting_time'])
         y = df_res['waiting_time']
@@ -252,10 +264,10 @@ def build_models_wt(
         leaves = list(y_leaf['Leaf'].unique())
         for l in leaves:
             y = y_leaf[y_leaf['Leaf']==l]['Y']
-            dist, params = return_best_distribution(y, dist_search=["norm"])
-            max_value = int(max(y))
+            dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
+            max_value = int(np.quantile(y, 0.95))
             min_value = int(min(y))
-            sampled = sampling_from_dist(dist, params, min_value, max_value, np.mean(y))
+            sampled = sampling_from_dist(dist, params, min_value, max_value, np.median(y), n_sample=max(len(y), 1000))
             clf.rules[l]['dist'] = dist, params
             clf.rules[l]['sampled'] = list(sampled)
         
@@ -269,153 +281,148 @@ def build_models_wt(
 
 def build_training_df_arrival(
         log: EventLog, 
-        calendar_arrival: dict, 
-        START_TS_LABEL: str = 'start:timestamp'
+        calendar_arrival: dict
     ) -> pd.DataFrame:
+
+    df_log = pm4py.convert_to_dataframe(log)
+    first_ts = df_log.groupby('case:concept:name')["start:timestamp"].min()
+    ordered_first_ts_list = first_ts.sort_values().tolist()
+
 
     dict_df = {'hour': []} | {'weekday': []} | {'arrival_time': []}
 
-    for i in range(len(log)-1):
-        trace_cur = log[i]
-        trace_next = log[i+1]
+    for i in range(1, len(ordered_first_ts_list)):
+        dict_df['hour'].append(ordered_first_ts_list[i-1].hour)
+        dict_df['weekday'].append(ordered_first_ts_list[i-1].weekday())
+        dict_df['arrival_time'].append(max((ordered_first_ts_list[i] - ordered_first_ts_list[i-1]).total_seconds()/60 - count_false_hours(calendar_arrival, ordered_first_ts_list[i-1], ordered_first_ts_list[i])*60, 0))
 
-        cur_ts = trace_cur[0][START_TS_LABEL]
-        next_ts = trace_next[0][START_TS_LABEL]
-
-        dict_df['hour'].append(cur_ts.hour)
-        dict_df['weekday'].append(cur_ts.weekday())
-
-        ar_time = max((next_ts - cur_ts).total_seconds()/60 - count_false_hours(calendar_arrival, cur_ts, next_ts)*60, 0)
-        dict_df['arrival_time'].append(ar_time)   
-    
     df = pd.DataFrame(dict_df)
-    
+
     return df
 
 
 
 def build_training_df_ex(
-        log: EventLog, 
+        df_features: pd.DataFrame,
+        resources: list, 
         activity_labels: list, 
         calendars: dict,
         label_data_attributes: list, 
         label_data_attributes_categorical: list, 
-        values_categorical: dict, 
-        mode_act_history: bool,
-        START_TS_LABEL: str ='start:timestamp', 
-        END_TS_LABEL: str='time:timestamp'
+        values_categorical: dict
     ) -> pd.DataFrame:
     
-    if mode_act_history:
-        dict_df = {'activity_executed': []} | {
-                    attr: [] for attr in label_data_attributes} | {
-                    'resource': []} | {
-                    act: [] for act in activity_labels} | {
-                    'hour': []} | {'weekday': []} | {
-                    'execution_time': []}
-    else:
-        dict_df = {'activity_executed': []} | {
-                    attr: [] for attr in label_data_attributes} | {
-                    'resource': []} | {
-                    'hour': []} | {'weekday': []} | {
-                    'execution_time': []}
+    df_et = df_features[["transition_label", "resource", "start_t", "end_t"] + label_data_attributes + activity_labels]
+    df_et = df_et[~df_et["start_t"].isna()]
+    df_et["execution_time"] = df_et.apply(lambda x: max((x["end_t"] - x["start_t"]).total_seconds()/60 - count_false_hours(calendars[x["resource"]], x["start_t"], x["end_t"])*60, 0), axis=1)
+    df_et.drop(columns=["start_t", "end_t"], inplace=True)
+    df_et.rename(columns={"transition_label": "activity_executed"}, inplace=True)
+    df_et.reset_index(drop=True, inplace=True)
 
-
-    for trace in log:
-        
-        try:
-            trace_attributes = {a: trace[a] for a in label_data_attributes}
-        except:
-            trace_attributes = {a: trace[0][a] for a in label_data_attributes}
-
-        if mode_act_history:
-            trace_history = {a: 0 for a in activity_labels}
-        
-        for event in trace:
-            if event['concept:name'] not in activity_labels:
-                continue
-
-            for a in label_data_attributes:
-                dict_df[a].append(trace_attributes[a])
-            
-            if mode_act_history:
-                for a in activity_labels:
-                    dict_df[a].append(trace_history[a])
-
-            act_executed = event['concept:name']
-            dict_df['activity_executed'].append(act_executed)
-            if mode_act_history:
-                trace_history[act_executed] += 1
-
-            start_ts = event[START_TS_LABEL]
-            end_ts = event[END_TS_LABEL]
-
-            res = event['org:resource']
-
-            dict_df['resource'].append(res)
-
-            dict_df['hour'].append(start_ts.hour)
-            dict_df['weekday'].append(start_ts.weekday())
-
-            ex_time = max((end_ts - start_ts).total_seconds()/60 - count_false_hours(calendars[res], start_ts, end_ts)*60, 0)
-            dict_df['execution_time'].append(ex_time)
-        
-    df = pd.DataFrame(dict_df)
-
-    resources = list(pm4py.get_event_attribute_values(log, 'org:resource').keys())
     for r in resources:
-        df['resource = '+r] = (df['resource'] == r)*1
-    del df['resource']
+        df_et['resource = '+r] = (df_et['resource'] == r).astype(int)
+    del df_et['resource']
 
     for a in label_data_attributes_categorical:
         for v in values_categorical[a]:
-            df[a+' = '+str(v)] = (df[a] == v)*1
-        del df[a]
+            df_et[a+' = '+str(v)] = (df_et[a] == v).astype(int)
+        del df_et[a]
 
-    return df
+    return df_et
 
 
 
 def build_training_df_wt(
-        log: EventLog, 
+        df_features: pd.DataFrame,
+        net_transition_labels: list,
         calendars: dict, 
-        label_data_attributes: list, 
-        START_TS_LABEL: str = 'start:timestamp', 
-        END_TS_LABEL: str = 'time:timestamp'
+        label_data_attributes: list,
+        label_data_attributes_categorical: list,
+        values_categorical: dict
     ) -> dict:
 
-    resources = list(pm4py.get_event_attribute_values(log, 'org:resource').keys())
+    df_wt = df_features[["resource", "start_t", "enabled_t", "res_workload"] + label_data_attributes + net_transition_labels]
+    df_wt = df_wt[~df_wt["start_t"].isna()]
+    df_wt["waiting_time"] = df_wt.apply(lambda x: max((x["start_t"] - x["enabled_t"]).total_seconds()/60 - count_false_hours(calendars[x["resource"]], x["enabled_t"], x["start_t"])*60, 0), axis=1)
+    df_wt.drop(columns=["start_t", "enabled_t"], inplace=True)
+    df_wt.rename(columns={"res_workload": "workload"}, inplace=True)
+    df_wt.reset_index(drop=True, inplace=True)
+
+    for a in label_data_attributes_categorical:
+        for v in values_categorical[a]:
+            df_wt[a+' = '+str(v)] = (df_wt[a] == v).astype(int)
+        del df_wt[a]
+
+    return df_wt
+
+
+
+# NO RULES MODE
+
+def find_best_distribution_arrival(log: EventLog, 
+        calendar_arrival: dict
+    ) -> tuple:
 
     df_log = pm4py.convert_to_dataframe(log)
+    first_ts = df_log.groupby('case:concept:name')["start:timestamp"].min()
+    ordered_first_ts_list = first_ts.sort_values().tolist()
 
-    df_log[START_TS_LABEL] = df_log[START_TS_LABEL].apply(lambda x: datetime.datetime.fromisoformat(str(x)[:-6]).timestamp())
-    df_log[END_TS_LABEL] = df_log[END_TS_LABEL].apply(lambda x: datetime.datetime.fromisoformat(str(x)[:-6]).timestamp())
+    arrival_times = []
+    for i in range(1, len(ordered_first_ts_list)):
+        arrival_times.append(max((ordered_first_ts_list[i] - ordered_first_ts_list[i-1]).total_seconds()/60 - count_false_hours(calendar_arrival, ordered_first_ts_list[i-1], ordered_first_ts_list[i])*60, 0))
 
-    dict_df_per_res = {
-                    res: {attr: [] for attr in label_data_attributes} | 
-                         {'hour': [], 'weekday': [], 'n. running events': [], 'waiting_time': []} |
-                         {'n. running events': [], 'waiting_time': []} 
-                    for res in resources
-                    }
+    dist, params = return_best_distribution(arrival_times, dist_search=DIST_SEARCH)
+    max_value = int(np.quantile(arrival_times, 0.95))
+    min_value = int(min(arrival_times))
 
-    for trace in log:
-        try:
-            trace_attributes = {a: trace[a] for a in label_data_attributes}
-        except:
-            trace_attributes = {a: trace[0][a] for a in label_data_attributes}
-        for i in range(1,len(trace)):
-            res = trace[i]['org:resource']
-            for attr in label_data_attributes:
-                dict_df_per_res[res][attr].append(trace_attributes[attr])
-            prev_ts = trace[i-1][END_TS_LABEL]
-            start_ts = trace[i][START_TS_LABEL]
-            dict_df_per_res[res]['hour'].append(prev_ts.hour)
-            dict_df_per_res[res]['weekday'].append(prev_ts.weekday())
-            df_log_filtered = df_log[(df_log[END_TS_LABEL] > prev_ts.timestamp()) & (df_log[START_TS_LABEL] < prev_ts.timestamp())]
-            n_active_ev = (df_log_filtered['org:resource']==res).sum()
-            dict_df_per_res[res]['n. running events'].append(n_active_ev)
-            dict_df_per_res[res]['waiting_time'].append(max((start_ts - prev_ts).total_seconds()/60 - count_false_hours(calendars[res], prev_ts, start_ts)*60 , 0))
+    return dist, params, min_value, max_value, np.median(arrival_times)
 
-    df_per_res = {res: pd.DataFrame(dict_df_per_res[res]) for res in resources}
 
-    return df_per_res
+def find_best_distribution_ex(df_features: pd.DataFrame, 
+        activity_labels: list,
+        calendars: dict
+    ) -> dict:
+
+    df_et = df_features[["transition_label", "resource", "start_t", "end_t"]]
+    df_et = df_et[~df_et["start_t"].isna()]
+    df_et["execution_time"] = df_et.apply(lambda x: max((x["end_t"] - x["start_t"]).total_seconds()/60 - count_false_hours(calendars[x["resource"]], x["start_t"], x["end_t"])*60, 0), axis=1)
+
+    activity_exec_time_distributions = dict()
+
+    for act in activity_labels:
+        df_act = df_et[df_et['transition_label'] == act]
+
+        exec_times = df_act['execution_time'].dropna().tolist()
+
+        dist, params = return_best_distribution(exec_times, dist_search=DIST_SEARCH)
+        max_value = int(np.quantile(exec_times, 0.95))
+        min_value = int(min(exec_times))
+
+        activity_exec_time_distributions[act] = (dist, params, min_value, max_value, np.median(exec_times))
+
+    return activity_exec_time_distributions
+
+
+def find_best_distribution_wt(df_features: pd.DataFrame,
+        resources: list,
+        calendars: dict
+    ) -> dict:
+
+    df_wt = df_features[["resource", "start_t", "enabled_t"]]
+    df_wt = df_wt[~df_wt["start_t"].isna()]
+    df_wt["waiting_time"] = df_wt.apply(lambda x: max((x["start_t"] - x["enabled_t"]).total_seconds()/60 - count_false_hours(calendars[x["resource"]], x["enabled_t"], x["start_t"])*60, 0), axis=1)
+    df_wt.reset_index(drop=True, inplace=True)
+
+    res_waiting_time_distributions = dict()
+
+    for res in resources:
+        df_res = df_wt[df_wt['resource'] == res]
+        waiting_times = df_res['waiting_time'].dropna().tolist()
+
+        dist, params = return_best_distribution(waiting_times, dist_search=DIST_SEARCH)
+        max_value = int(np.quantile(waiting_times, 0.95))
+        min_value = int(min(waiting_times))
+
+        res_waiting_time_distributions[res] = (dist, params, min_value, max_value, np.median(waiting_times))
+
+    return res_waiting_time_distributions
