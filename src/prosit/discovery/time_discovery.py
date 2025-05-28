@@ -106,6 +106,11 @@ def build_model_arrival(
     X = df.drop(columns=['arrival_time'])
     y = df['arrival_time']
 
+    if len(X) == 0:
+        clf = DecisionRules()
+        clf.rules = {0: {'value': 0.0, 'sampled':[0], 'dist': ('fixed', (0,))}}
+        return clf
+
     if max_depths:
         if len(X)>3:
             clf_mean = DecisionTreeRegressor(random_state=72)
@@ -174,6 +179,12 @@ def build_models_ex(
         X = df_act.drop(columns=['execution_time'])
         y = df_act['execution_time']
 
+        if len(X) == 0:
+            clf = DecisionRules()
+            clf.rules = {0: {'value': 0.0, 'sampled':[0], 'dist': ('fixed', (0,))}}
+            models_act[act] = clf
+            continue
+
         if max_depths:
             if len(X)>3:
                 clf_mean = DecisionTreeRegressor(random_state=72)
@@ -239,6 +250,12 @@ def build_models_wt(
 
         X = df_res.drop(columns=['waiting_time'])
         y = df_res['waiting_time']
+
+        if len(X) == 0:
+            clf = DecisionRules()
+            clf.rules = {0: {'value': 0.0, 'sampled':[0], 'dist': ('fixed', (0,))}}
+            models_res[res] = clf
+            continue
 
         if max_depths:
             if len(X)>3:
