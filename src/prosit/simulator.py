@@ -74,7 +74,7 @@ class SimulatorParameters:
     def discover_from_eventlog(
             self, 
             log: EventLog, 
-            max_depth_tree: list = 3,
+            max_depth_tree: int = 3,
             verbose: bool = True
         ):
         """ Discovery Parameters from event log data """
