@@ -34,6 +34,8 @@ def return_best_distribution(data: any, dist_search: list = ['fixed', 'norm', 'e
             return 'fixed', data[0]
         else:
             return 'fixed', data.iloc[0]
+    if len(data) == 0:
+        return 'fixed', 0
 
     for dist_name in dist_search:
 

@@ -412,8 +412,12 @@ def find_best_distribution_ex(df_features: pd.DataFrame,
         exec_times = df_act['execution_time'].dropna().tolist()
 
         dist, params = return_best_distribution(exec_times, dist_search=DIST_SEARCH)
-        max_value = int(np.quantile(exec_times, 0.95))
-        min_value = int(min(exec_times))
+        if len(exec_times) == 0:
+            max_value = 0
+            min_value = 0
+        else:
+            max_value = int(np.quantile(exec_times, 0.95))
+            min_value = int(min(exec_times))
 
         activity_exec_time_distributions[act] = (dist, params, min_value, max_value, np.median(exec_times))
 
