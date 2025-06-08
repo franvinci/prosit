@@ -131,6 +131,7 @@ class DecisionRules:
         self.graph = None
 
     def from_decision_tree(self, decision_tree):
+        self.decision_tree = decision_tree
         self.graph = build_graph_vis(decision_tree, True)
         nodes, edges = parse_tree(self.graph.source)
         self.rules = build_tree_structure(nodes, edges)

@@ -136,10 +136,10 @@ def build_model_arrival(
     leaves = list(y_leaf['Leaf'].unique())
     for l in leaves:
         y = y_leaf[y_leaf['Leaf']==l]['Y']
+        min_value = np.min(y)
+        max_value = np.max(y)
         dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
-        max_value = int(np.quantile(y, 0.95))
-        min_value = int(min(y))
-        sampled = sampling_from_dist(dist, params, min_value, max_value, np.median(y), n_sample=max(len(y), 1000))
+        sampled = sampling_from_dist(dist, params, min_value, max_value, clf.rules[l]['value'], n_sample=max(len(y), 1000))
         clf.rules[l]['dist'] = dist, params
         clf.rules[l]['sampled'] = list(sampled)
 
@@ -209,10 +209,10 @@ def build_models_ex(
         leaves = list(y_leaf['Leaf'].unique())
         for l in leaves:
             y = y_leaf[y_leaf['Leaf']==l]['Y']
+            min_value = np.min(y)
+            max_value = np.max(y)
             dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
-            max_value = int(np.quantile(y, 0.95))
-            min_value = int(min(y))
-            sampled = sampling_from_dist(dist, params, min_value, max_value, np.median(y), n_sample=max(len(y), 1000))
+            sampled = sampling_from_dist(dist, params, min_value, max_value, clf.rules[l]["value"], n_sample=max(len(y), 1000))
             clf.rules[l]['dist'] = dist, params
             clf.rules[l]['sampled'] = list(sampled)
 
@@ -281,10 +281,10 @@ def build_models_wt(
         leaves = list(y_leaf['Leaf'].unique())
         for l in leaves:
             y = y_leaf[y_leaf['Leaf']==l]['Y']
+            min_value = np.min(y)
+            max_value = np.max(y)
             dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
-            max_value = int(np.quantile(y, 0.95))
-            min_value = int(min(y))
-            sampled = sampling_from_dist(dist, params, min_value, max_value, np.median(y), n_sample=max(len(y), 1000))
+            sampled = sampling_from_dist(dist, params, min_value, max_value, clf.rules[l]["value"], n_sample=max(len(y), 1000))
             clf.rules[l]['dist'] = dist, params
             clf.rules[l]['sampled'] = list(sampled)
         
@@ -304,7 +304,6 @@ def build_training_df_arrival(
     df_log = pm4py.convert_to_dataframe(log)
     first_ts = df_log.groupby('case:concept:name')["start:timestamp"].min()
     ordered_first_ts_list = first_ts.sort_values().tolist()
-
 
     dict_df = {'hour': []} | {'weekday': []} | {'arrival_time': []}
 
@@ -389,10 +388,10 @@ def find_best_distribution_arrival(log: EventLog,
         arrival_times.append(max((ordered_first_ts_list[i] - ordered_first_ts_list[i-1]).total_seconds()/60 - count_false_hours(calendar_arrival, ordered_first_ts_list[i-1], ordered_first_ts_list[i])*60, 0))
 
     dist, params = return_best_distribution(arrival_times, dist_search=DIST_SEARCH)
-    max_value = int(np.quantile(arrival_times, 0.95))
-    min_value = int(min(arrival_times))
+    min_value = np.min(arrival_times)
+    max_value = np.max(arrival_times)
 
-    return dist, params, min_value, max_value, np.median(arrival_times)
+    return dist, params, min_value, max_value, np.mean(arrival_times)
 
 
 def find_best_distribution_ex(df_features: pd.DataFrame, 
@@ -413,13 +412,18 @@ def find_best_distribution_ex(df_features: pd.DataFrame,
 
         dist, params = return_best_distribution(exec_times, dist_search=DIST_SEARCH)
         if len(exec_times) == 0:
+            dist = 'fixed'
+            params = (0,)
             max_value = 0
             min_value = 0
+            mean_value = 0
         else:
-            max_value = int(np.quantile(exec_times, 0.95))
-            min_value = int(min(exec_times))
+            dist, params = return_best_distribution(exec_times, dist_search=DIST_SEARCH)
+            min_value = np.min(exec_times)
+            max_value = np.max(exec_times)
+            mean_value = np.mean(exec_times)
 
-        activity_exec_time_distributions[act] = (dist, params, min_value, max_value, np.median(exec_times))
+        activity_exec_time_distributions[act] = (dist, params, min_value, max_value, mean_value)
 
     return activity_exec_time_distributions
 
@@ -440,10 +444,18 @@ def find_best_distribution_wt(df_features: pd.DataFrame,
         df_res = df_wt[df_wt['resource'] == res]
         waiting_times = df_res['waiting_time'].dropna().tolist()
 
-        dist, params = return_best_distribution(waiting_times, dist_search=DIST_SEARCH)
-        max_value = int(np.quantile(waiting_times, 0.95))
-        min_value = int(min(waiting_times))
+        if len(waiting_times) == 0:
+            dist = 'fixed'
+            params = (0,)
+            min_value = 0
+            max_value = 0
+            mean_value = 0
+        else:
+            dist, params = return_best_distribution(waiting_times, dist_search=DIST_SEARCH)
+            min_value = np.min(waiting_times)
+            max_value = np.max(waiting_times)
+            mean_value = np.mean(waiting_times)
 
-        res_waiting_time_distributions[res] = (dist, params, min_value, max_value, np.median(waiting_times))
+        res_waiting_time_distributions[res] = (dist, params, min_value, max_value, mean_value)
 
     return res_waiting_time_distributions

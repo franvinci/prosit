@@ -22,7 +22,7 @@ def discover_weight_transitions(
 
     if not max_depths_cv:
         transitions = df_features['transition'].unique()
-        transition_weights = {t: len(df_features[df_features['transition'] == t]) for t in transitions}
+        transition_weights = {t: (df_features["transition"] == t).sum() / df_features["prev_enabled_transitions"].apply(lambda t_set: t in t_set).sum() for t in transitions}
     else:
         transition_weights = build_models(
                                             df_features,

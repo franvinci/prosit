@@ -98,7 +98,7 @@ class SimulatorParameters:
 
         if verbose:
             print("Feature discovery...")
-            df_features = build_df_features(log, self.net, self.initial_marking, self.final_marking, self.net_transition_labels, self.label_data_attributes)
+        df_features = build_df_features(log, self.net, self.initial_marking, self.final_marking, self.net_transition_labels, self.label_data_attributes)
 
         if verbose:
             print("Transition probabilities discovery...")
@@ -110,6 +110,9 @@ class SimulatorParameters:
                                                                 label_data_attributes_categorical=self.label_data_attributes_categorical, 
                                                                 values_categorical=self.attribute_values_label_categorical
                                                             )
+        for t in self.net.transitions:
+            if t not in self.transition_weights.keys():
+                self.transition_weights[t] = 0
 
         if verbose:
             print("Resources discovery...")
@@ -371,7 +374,7 @@ class SimulatorEngine:
         self.simulation_parameters = simulation_parameters
 
 
-    def apply(self, n_traces: int = 1, t_start: datetime = datetime.now()) -> pd.DataFrame:
+    def apply(self, n_traces: int = 1, t_start: datetime = datetime.now(), deterministic_time=False) -> pd.DataFrame:
 
         event_log = []
         enabled_heap = []
@@ -379,9 +382,14 @@ class SimulatorEngine:
         cases = []
 
         if not self.simulation_parameters.rules_mode:
-            sampled_arrivals = sampling_from_dist(*self.simulation_parameters.arrival_time_distribution, n_sample=n_traces)
-            sampled_waiting_times = {res : sampling_from_dist(*self.simulation_parameters.waiting_time_distributions[res], n_sample=n_traces) for res in self.simulation_parameters.resources}
-            sampled_execution_times = {act: sampling_from_dist(*self.simulation_parameters.execution_time_distributions[act], n_sample=n_traces) for act in self.simulation_parameters.net_transition_labels}
+            if deterministic_time:
+                sampled_arrivals = self.simulation_parameters.arrival_time_distribution[-1]
+                sampled_waiting_times = {res : self.simulation_parameters.waiting_time_distributions[res][-1] for res in self.simulation_parameters.resources}
+                sampled_execution_times = {act: self.simulation_parameters.execution_time_distributions[act][-1] for act in self.simulation_parameters.net_transition_labels}
+            else:
+                sampled_arrivals = sampling_from_dist(*self.simulation_parameters.arrival_time_distribution, n_sample=n_traces)
+                sampled_waiting_times = {res : sampling_from_dist(*self.simulation_parameters.waiting_time_distributions[res], n_sample=n_traces) for res in self.simulation_parameters.resources}
+                sampled_execution_times = {act: sampling_from_dist(*self.simulation_parameters.execution_time_distributions[act], n_sample=n_traces) for act in self.simulation_parameters.net_transition_labels}
 
         if self.simulation_parameters.label_data_attributes:
             x_attr_list = random.choices(
@@ -410,7 +418,10 @@ class SimulatorEngine:
                 trace_attributes = dict()
 
             if not self.simulation_parameters.rules_mode:
-                arrival_delta = sampled_arrivals[i]
+                if deterministic_time:
+                    arrival_delta = sampled_arrivals
+                else:
+                    arrival_delta = sampled_arrivals[i]
             else:
                 if self.simulation_parameters.online_discovery:
                     arrival_pred = self.simulation_parameters.arrival_time_distribution.debug_one({'hour': current_arr_ts.hour,'weekday': current_arr_ts.weekday()})
@@ -426,7 +437,12 @@ class SimulatorEngine:
                         elif arrival_delta > self.simulation_parameters.max_at:
                             arrival_delta = mean
                 else:   
-                    arrival_delta = self.simulation_parameters.arrival_time_distribution.apply_distribution({'hour': current_arr_ts.hour,'weekday': current_arr_ts.weekday()})
+                    if deterministic_time:
+                        arrival_delta = self.simulation_parameters.arrival_time_distribution.apply({'hour': current_arr_ts.hour,'weekday': current_arr_ts.weekday()})
+                    else:
+                        arrival_delta = self.simulation_parameters.arrival_time_distribution.apply_distribution({'hour': current_arr_ts.hour,'weekday': current_arr_ts.weekday()})
+            if arrival_delta == 0:
+                arrival_delta = 1
             current_arr_ts = add_minutes_with_calendar(current_arr_ts, int(arrival_delta), self.simulation_parameters.arrival_calendar)
 
             case = {
@@ -479,10 +495,17 @@ class SimulatorEngine:
                 r_workload = count_concurrent_events(resource_schedule[resource], t_enabled)
                 
                 if sum(case["history"].values()) == 0:
-                        waiting_time = 0
+                    waiting_time = 0
                 else:
                     if not self.simulation_parameters.rules_mode:
-                        waiting_time = random.choice(sampled_waiting_times[resource])
+                        if deterministic_time:
+                            waiting_time = sampled_waiting_times[resource]
+                            try:
+                                int(waiting_time)
+                            except:
+                                waiting_time = 0
+                        else:
+                            waiting_time = random.choice(sampled_waiting_times[resource])
                     else:
                         if self.simulation_parameters.online_discovery:
                             waiting_time_pred = self.simulation_parameters.waiting_time_distributions[resource].debug_one({'workload': r_workload} | case["history"] | case["attributes"])
@@ -498,10 +521,26 @@ class SimulatorEngine:
                                 elif waiting_time > self.simulation_parameters.max_wt[resource]:
                                     waiting_time = mean
                         else:
-                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply_distribution({'workload': r_workload} | case["history"] | case["attributes"])
+                            if deterministic_time:
+                                waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply({'workload': r_workload} | case["history"] | case["attributes"])
+                                try:
+                                    int(waiting_time)
+                                except:
+                                    waiting_time = 0
+                            else:
+                                waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply_distribution({'workload': r_workload} | case["history"] | case["attributes"])
+
+                t_start_exec = add_minutes_with_calendar(t_enabled, int(waiting_time), self.simulation_parameters.calendars[resource])
 
                 if not self.simulation_parameters.rules_mode:
-                    ex_time = random.choice(sampled_execution_times[activity])
+                    if deterministic_time:
+                        ex_time = sampled_execution_times[activity]
+                        try:
+                            int(ex_time)
+                        except:
+                            ex_time = 0
+                    else:
+                        ex_time = random.choice(sampled_execution_times[activity])
                 else:
                     if self.simulation_parameters.online_discovery:
                         ex_time_pred = self.simulation_parameters.execution_time_distributions[activity].debug_one({'resource = '+res: (res == resource)*1 for res in self.simulation_parameters.resources} | case["history"] | case["attributes"])
@@ -517,10 +556,16 @@ class SimulatorEngine:
                             elif ex_time > self.simulation_parameters.max_et[activity]:
                                 ex_time = mean         
                     else:
-                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply_distribution({'resource = '+res: (res == resource)*1 for res in self.simulation_parameters.resources} | case["history"] | case["attributes"])
+                        if deterministic_time:
+                            ex_time = self.simulation_parameters.execution_time_distributions[activity].apply({'resource = '+res: (res == resource)*1 for res in self.simulation_parameters.resources} | case["history"] | case["attributes"])
+                            try:
+                               int(ex_time)
+                            except: 
+                                ex_time = 0
+                        else:
+                            ex_time = self.simulation_parameters.execution_time_distributions[activity].apply_distribution({'resource = '+res: (res == resource)*1 for res in self.simulation_parameters.resources} | case["history"] | case["attributes"])
 
                 
-                t_start_exec = add_minutes_with_calendar(t_enabled, int(waiting_time), self.simulation_parameters.calendars[resource])
                 t_end = add_minutes_with_calendar(t_start_exec, int(ex_time), self.simulation_parameters.calendars[resource])
 
                 event_log.append((case_id, activity, resource, t_enabled, t_start_exec, t_end) + tuple(x_attr_list[case_id]))
