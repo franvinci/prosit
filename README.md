@@ -44,8 +44,7 @@ sim_log = simulator_eng.apply(n_sim_traces, start_ts_simulation=log[0][0]['start
 
 🟩 = Best result, 🟥 = Worst result
 
-<!DOCTYPE html>
-<html lang="en">
+
 <head>
   <meta charset="UTF-8">
   <title>ProSiT Evaluation Table</title>
@@ -94,15 +93,14 @@ sim_log = simulator_eng.apply(n_sim_traces, start_ts_simulation=log[0][0]['start
   </style>
 </head>
 <body>
-
 <table>
   <thead>
     <tr>
       <th>Case Study</th>
       <th>Metric</th>
       <th>Simod</th>
-      <th>Dsim</th>
-      <th>RiMS</th>
+      <th>DSim</th>
+      <th>RIMS</th>
       <th class="prosit-col">ProSiT</th>
     </tr>
   </thead>
@@ -134,7 +132,6 @@ sim_log = simulator_eng.apply(n_sim_traces, start_ts_simulation=log[0][0]['start
     <tr><td>CAR</td><td class="worst">145.961497</td><td class="best">24.326364</td><td>82.289713</td><td class="prosit-col">53.717958</td></tr>
   </tbody>
 </table>
-
 </body>
 </html>
 
