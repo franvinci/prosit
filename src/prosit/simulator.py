@@ -5,9 +5,12 @@ import heapq
 from datetime import datetime
 from tqdm import tqdm
 
+from typing import Union, List, Dict, Optional
+
 import pm4py
 from pm4py.objects.petri_net.obj import PetriNet, Marking
 from pm4py.objects.log.obj import EventLog
+from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
 
 from cortado_core.lca_approach import add_trace_to_pt_language
 
@@ -374,12 +377,48 @@ class SimulatorEngine:
         self.simulation_parameters = simulation_parameters
 
 
-    def apply(self, n_traces: int = 1, t_start: datetime = datetime.now(), deterministic_time=False) -> pd.DataFrame:
+    def apply(self, n_traces: int = 1, t_start: datetime = datetime.now(), deterministic_time: bool = False, prev_log: Optional[pd.DataFrame] = None) -> pd.DataFrame:
 
         event_log = []
         enabled_heap = []
         resource_schedule = {r: [] for r in self.simulation_parameters.resources}
         cases = []
+
+        if prev_log is not None:
+
+            # computing the number of traces we want to simulate as the number of traces that started during the longest trace in the previous log
+            trace_durations = prev_log.groupby("case:concept:name").agg(
+                trace_start=('start:timestamp', 'min'),
+                trace_end=('time:timestamp', 'max')
+            )
+            trace_durations['duration'] = trace_durations['trace_end'] - trace_durations['trace_start']
+            longest_trace = trace_durations.loc[trace_durations['duration'].idxmax()]
+            longest_start = longest_trace['trace_start']
+            longest_end = longest_trace['trace_end']
+            longest_case = trace_durations['duration'].idxmax()
+            started_during_longest = trace_durations[
+                (trace_durations['trace_start'] >= longest_start) &
+                (trace_durations['trace_start'] <= longest_end) &
+                (trace_durations.index != longest_case)
+            ]
+            n_traces = started_during_longest.shape[0]
+
+            # compute the t_start
+            t_start = trace_durations["trace_start"].max()
+
+            # update the resource_schedule with the previous log
+            for _, row in prev_log.iterrows():
+                if row['org:resource'] not in resource_schedule:
+                    resource_schedule[row['org:resource']] = []
+                resource_schedule[row['org:resource']].append((row['start:timestamp'], row['time:timestamp']))
+
+            # filter only the prefixes
+            cases_prefixes = list(prev_log[~prev_log['recommendation:act'].isna() | ~prev_log['recommendation:res'].isna()]["case:concept:name"].unique())
+            n_prefixes = len(cases_prefixes)
+            prefixes_log = prev_log[prev_log['case:concept:name'].isin(cases_prefixes)]
+        
+        else:
+            n_prefixes = 0
 
         if not self.simulation_parameters.rules_mode:
             if deterministic_time:
@@ -402,6 +441,70 @@ class SimulatorEngine:
             x_attr_list = [[]]*n_traces
 
         current_arr_ts = t_start
+
+        # INITIALIZE CASES
+
+        if prev_log is not None:
+            rename_case_id = dict()
+            for c in range(n_prefixes):
+                case_id_c = cases_prefixes[c]
+                rename_case_id[f"case_{c+1}"] = case_id_c
+                prefix_log_c = prefixes_log[prefixes_log['case:concept:name'] == case_id_c]
+                rec_act_c = prefix_log_c['recommendation:act'].iloc[-1]
+                rec_res_c = prefix_log_c['recommendation:res'].iloc[-1]
+
+                replayed = token_replay.apply(
+                                                prefix_log_c, 
+                                                self.simulation_parameters.net, 
+                                                self.simulation_parameters.initial_marking, 
+                                                self.simulation_parameters.final_marking
+                                            )
+
+                current_marking_c = replayed[0]["reached_marking"]
+
+                history_c_list = [t_l.label for t_l in replayed[0]["activated_transitions"] if t_l.label]
+                history_c = {t: 0 for t in self.simulation_parameters.net_transition_labels}
+                for t in history_c_list:
+                    history_c[t] += 1
+
+                trace_attributes = prefix_log_c[self.simulation_parameters.label_data_attributes].iloc[-1].to_dict()
+                trace_attributes_c = dict()
+                if self.simulation_parameters.label_data_attributes:
+                    for  a in self.simulation_parameters.label_data_attributes:
+                        if a in self.simulation_parameters.label_data_attributes_categorical:
+                            for v in self.simulation_parameters.attribute_values_label_categorical[a]:
+                                trace_attributes_c[a+' = '+str(v)] = int(trace_attributes[a] == v)
+                        else:
+                            trace_attributes_c[a] = trace_attributes
+
+                case = {
+                        "arrival_time": current_arr_ts,
+                        "case_id": c,
+                        "marking": current_marking_c,
+                        "place_token_time": {},
+                        "enabled": {},
+                        "history": history_c,
+                        "attributes": trace_attributes_c,
+                        "rec_act": rec_act_c,
+                        "rec_res": rec_res_c
+                    }
+
+                for place in self.net.places:
+                    case["place_token_time"][place] = None
+                for place in current_marking_c.keys():
+                    case["place_token_time"][place] = case["arrival_time"]
+
+                enabled = return_enabled_transitions(self.net, case["marking"])
+                for t in enabled:
+                    input_places = [arc.source for arc in self.net.arcs if arc.target == t]
+                    enabled_time = max(case["place_token_time"][p] for p in input_places)
+                    case["enabled"][t] = prefix_log_c["time:timestamp"].iloc[-1]
+
+                if case["enabled"]:
+                    enabled_time_case = min(case["enabled"].values())
+                    heapq.heappush(enabled_heap, (enabled_time_case, c))
+
+                cases.append(case)
 
         for i in range(n_traces):
 
@@ -446,13 +549,15 @@ class SimulatorEngine:
             current_arr_ts = add_minutes_with_calendar(current_arr_ts, int(arrival_delta), self.simulation_parameters.arrival_calendar)
 
             case = {
-                "case_id": i,
+                "case_id": i + n_prefixes,
                 "marking": self.initial_marking,
                 "arrival_time": current_arr_ts,
                 "place_token_time": {},
                 "enabled": {},
                 "history": {t: 0 for t in self.simulation_parameters.net_transition_labels},
-                "attributes": trace_attributes
+                "attributes": trace_attributes,
+                "rec_act": None,
+                "rec_res": None
             }
             for place in self.net.places:
                 case["place_token_time"][place] = None
@@ -470,6 +575,7 @@ class SimulatorEngine:
 
             cases.append(case)
 
+        # START SIMULATION
         completed_cases = set()
         pbar = tqdm(total=n_traces, desc="Simulating Cases")
         while enabled_heap:
@@ -480,18 +586,31 @@ class SimulatorEngine:
                 continue
 
             enabled_transitions = list(case["enabled"].keys())
-            if not self.simulation_parameters.rules_mode:
-                transition_weights = self.simulation_parameters.transition_weights
-            else:
-                transition_weights = compute_transition_weights_from_model(self.simulation_parameters.transition_weights, case["attributes"] | case["history"])
-            chosen_transition = return_fired_transition(transition_weights, enabled_transitions)
-            activity = chosen_transition.label
-            t_enabled = case["enabled"][chosen_transition]
+            flag_rec = False
+            if case["rec_act"] is not None:
+                enabled_transitions_labels = [t.label for t in enabled_transitions]
+                if case["rec_act"] in enabled_transitions_labels:
+                    chosen_transition = enabled_transitions[enabled_transitions_labels.index(case["rec_act"])]
+                    activity = case["rec_act"]
+                    t_enabled = case["enabled"][chosen_transition]
+                    case["rec_act"] = None
+                    flag_rec = True
+            if not flag_rec:        
+                if not self.simulation_parameters.rules_mode:
+                    transition_weights = self.simulation_parameters.transition_weights
+                else:
+                    transition_weights = compute_transition_weights_from_model(self.simulation_parameters.transition_weights, case["attributes"] | case["history"])
+                chosen_transition = return_fired_transition(transition_weights, enabled_transitions)
+                activity = chosen_transition.label
+                t_enabled = case["enabled"][chosen_transition]
 
             if activity is not None:
-                resources = list(self.simulation_parameters.act_resource_prob[activity].keys())
-                resource_weights = list(self.simulation_parameters.act_resource_prob[activity].values())
-                resource = random.choices(resources, weights=resource_weights, k=1)[0]
+                if flag_rec and case["rec_res"] is not None:
+                    resource = case["rec_res"]
+                else:
+                    resources = list(self.simulation_parameters.act_resource_prob[activity].keys())
+                    resource_weights = list(self.simulation_parameters.act_resource_prob[activity].values())
+                    resource = random.choices(resources, weights=resource_weights, k=1)[0]
                 r_workload = count_concurrent_events(resource_schedule[resource], t_enabled)
                 
                 if sum(case["history"].values()) == 0:
@@ -597,6 +716,10 @@ class SimulatorEngine:
         pbar.close()
         df_log = pd.DataFrame(event_log, columns=["case:concept:name", "concept:name", "org:resource", "enabled:timestamp", "start:timestamp", "time:timestamp"] + self.simulation_parameters.label_data_attributes)
         df_log["case:concept:name"] = df_log["case:concept:name"].apply(lambda x: f"case_{x+1}")
+        if prev_log is not None:
+            df_log["case:concept:name"] = df_log["case:concept:name"].apply(lambda x: rename_case_id.get(x, x))
+            df_log = pd.concat([prev_log, df_log], ignore_index=True)
+            df_log = df_log[["case:concept:name", "concept:name", "org:resource", "start:timestamp", "time:timestamp"] + self.simulation_parameters.label_data_attributes]
         df_log.sort_values(by=["start:timestamp", "time:timestamp"], inplace=True)
         df_log.reset_index(drop=True, inplace=True)
 
