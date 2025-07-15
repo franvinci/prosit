@@ -9,8 +9,6 @@ import pm4py
 from pm4py.objects.petri_net.obj import PetriNet, Marking
 from pm4py.objects.log.obj import EventLog
 
-from cortado_core.lca_approach import add_trace_to_pt_language
-
 from prosit.discovery.cf_discovery import discover_weight_transitions
 from prosit.discovery.time_discovery import discover_execution_time_distributions, discover_arrival_time, discover_waiting_time
 from prosit.discovery.calendar_discovery import discover_res_calendars, discover_arrival_calendar
@@ -41,8 +39,7 @@ class SimulatorParameters:
             self, 
             net: PetriNet, 
             initial_marking: Marking,
-            final_marking: Marking,
-            grace_period: int = 1000,
+            final_marking: Marking
         ):
         """ Initilize parameters """
         
@@ -67,14 +64,13 @@ class SimulatorParameters:
 
         self.rules_mode: bool = False
 
-        self.online_discovery = None
-        self.grace_period = grace_period
-
 
     def discover_from_eventlog(
             self, 
             log: EventLog, 
             max_depth_tree: int = 3,
+            incremental_discovery: bool = False,
+            grace_period: int = 1000,
             verbose: bool = True
         ):
         """ Discovery Parameters from event log data """
@@ -101,15 +97,30 @@ class SimulatorParameters:
         df_features = build_df_features(log, self.net, self.initial_marking, self.final_marking, self.net_transition_labels, self.label_data_attributes)
 
         if verbose:
-            print("Transition probabilities discovery...")
-        self.transition_weights = discover_weight_transitions(
-                                                                df_features, 
-                                                                self.net_transition_labels, 
-                                                                max_depths_cv=max_depth_cv,                  
-                                                                label_data_attributes=self.label_data_attributes, 
-                                                                label_data_attributes_categorical=self.label_data_attributes_categorical, 
-                                                                values_categorical=self.attribute_values_label_categorical
-                                                            )
+            if incremental_discovery:
+                print("Incremental Transition Probabilities discovery...")
+            else:
+                print("Transition Probabilities discovery...")
+        
+        if incremental_discovery:
+            self.transition_weights = incremental_transition_weights_learning(
+                                                                    df_features, 
+                                                                    self.net_transition_labels, 
+                                                                    max_depth=max_depth_tree,
+                                                                    grace_period=grace_period,                  
+                                                                    label_data_attributes=self.label_data_attributes, 
+                                                                    label_data_attributes_categorical=self.label_data_attributes_categorical, 
+                                                                    values_categorical=self.attribute_values_label_categorical
+                                                                )
+        else:
+            self.transition_weights = discover_weight_transitions(
+                                                                    df_features, 
+                                                                    self.net_transition_labels, 
+                                                                    max_depths_cv=max_depth_cv,                  
+                                                                    label_data_attributes=self.label_data_attributes, 
+                                                                    label_data_attributes_categorical=self.label_data_attributes_categorical, 
+                                                                    values_categorical=self.attribute_values_label_categorical
+                                                                )
         for t in self.net.transitions:
             if t not in self.transition_weights.keys():
                 self.transition_weights[t] = 0
@@ -127,237 +138,74 @@ class SimulatorParameters:
         self.arrival_calendar = discover_arrival_calendar(log)
 
         if verbose:
-            print("Execution Time discovery...")
-        self.execution_time_distributions = discover_execution_time_distributions(
+            if incremental_discovery:
+                print("Incremental Execution Time discovery...")
+            else:
+                print("Execution Time discovery...")
+
+        if incremental_discovery:
+            self.execution_time_distributions = incremental_execution_time_learning(    
+                                                                                        df_features,
+                                                                                        self.net_transition_labels,
+                                                                                        self.resources,
+                                                                                        self.calendars, 
+                                                                                        max_depth=max_depth_tree,
+                                                                                        grace_period=grace_period,
+                                                                                        label_data_attributes=self.label_data_attributes, 
+                                                                                        label_data_attributes_categorical=self.label_data_attributes_categorical, 
+                                                                                        values_categorical=self.attribute_values_label_categorical
+                                                                                    )
+        else:
+            self.execution_time_distributions = discover_execution_time_distributions(
+                                                                                        df_features,
+                                                                                        self.net_transition_labels,
+                                                                                        self.resources,
+                                                                                        self.calendars, 
+                                                                                        max_depths=max_depth_cv,
+                                                                                        label_data_attributes=self.label_data_attributes, 
+                                                                                        label_data_attributes_categorical=self.label_data_attributes_categorical, 
+                                                                                        values_categorical=self.attribute_values_label_categorical
+                                                                                    )
+        if verbose:
+            if incremental_discovery:
+                print("Incremental Waiting Time discovery...")
+            else:
+                print("Waiting Time discovery...")
+
+        if incremental_discovery:
+            self.waiting_time_distributions = incremental_waiting_time_learning(
                                                                                     df_features,
                                                                                     self.net_transition_labels,
-                                                                                    self.resources,
+                                                                                    self.resources, 
                                                                                     self.calendars, 
-                                                                                    max_depths=max_depth_cv,
-                                                                                    label_data_attributes=self.label_data_attributes, 
-                                                                                    label_data_attributes_categorical=self.label_data_attributes_categorical, 
-                                                                                    values_categorical=self.attribute_values_label_categorical
-                                                                                )
-        if verbose:
-            print("Waiting Time discovery...")
-        self.waiting_time_distributions = discover_waiting_time(
-                                                                    df_features,
-                                                                    self.net_transition_labels,
-                                                                    self.resources, 
-                                                                    self.calendars, 
-                                                                    self.label_data_attributes, 
-                                                                    self.label_data_attributes_categorical, 
-                                                                    self.attribute_values_label_categorical, 
-                                                                    max_depths=max_depth_cv
-                                                                )
-        
-        if verbose:
-            print("Arrival Time discovery...")
-        self.arrival_time_distribution = discover_arrival_time(log, self.arrival_calendar, max_depths=max_depth_cv)
-        
-
-    def _firststep_incremental_discovery(
-            self, 
-            log: EventLog,
-            mode_act_history: bool = True,
-            verbose: bool = True
-        ):
-
-        self.mode_act_history = mode_act_history
-        self.label_data_attributes, self.label_data_attributes_categorical = return_label_data_attributes(log)
-        
-        for a in self.label_data_attributes_categorical:
-            self.attribute_values_label_categorical[a] = list(pm4py.get_event_attribute_values(log, a).keys())
-
-        if self.label_data_attributes:
-            if verbose:
-                print("Data attributes discovery...")
-            self.distribution_data_attributes = discover_attributes_distribution(log, self.label_data_attributes)
-
-        if verbose:
-            print("Transition probabilities discovery...")
-        self.transition_weights = incremental_transition_weights_learning(
-                                                                            None,
-                                                                            log,
-                                                                            self.net, 
-                                                                            self.initial_marking, 
-                                                                            self.final_marking,
-                                                                            self.net_transition_labels,
-                                                                            self.label_data_attributes,
-                                                                            self.label_data_attributes_categorical,
-                                                                            self.attribute_values_label_categorical,
-                                                                            self.mode_act_history,
-                                                                            grace_period=self.grace_period
-                                                                        )
-
-        if verbose:
-            print("Calendars discovery...")
-        self.calendars = discover_res_calendars(log)
-        self.arrival_calendar = discover_arrival_calendar(log)
-
-        if verbose:
-            print("Resources discovery...")
-        self.resources = list(pm4py.get_event_attribute_values(log, 'org:resource').keys())
-        self.act_resource_prob = discover_resource_acts_prob(log)
-
-
-        if verbose:
-            print("Execution Time discovery...")
-        self.execution_time_distributions, self.min_et, self.max_et = incremental_execution_time_learning(
-                                                                                    None,
-                                                                                    log, 
-                                                                                    self.net_transition_labels, 
-                                                                                    self.calendars,
                                                                                     self.label_data_attributes, 
                                                                                     self.label_data_attributes_categorical, 
                                                                                     self.attribute_values_label_categorical, 
-                                                                                    self.mode_act_history,
-                                                                                    grace_period=self.grace_period
+                                                                                    max_depth=max_depth_tree,
+                                                                                    grace_period=grace_period
                                                                                 )
-        if verbose:
-            print("Arrival discovery...")
-        self.arrival_time_distribution, self.min_at, self.max_at = incremental_model_arrival_learning(None, log, self.arrival_calendar, grace_period=self.grace_period)
-
-        if verbose:
-            print("Waiting Time discovery...")
-        self.waiting_time_distributions, self.min_wt, self.max_wt = incremental_waiting_time_learning(
-                                                                                None,
-                                                                                log, 
-                                                                                self.calendars, 
-                                                                                self.label_data_attributes, 
-                                                                                self.label_data_attributes_categorical, 
-                                                                                self.attribute_values_label_categorical,
-                                                                                grace_period=self.grace_period
-                                                                            )
-
-
-
-
-    def incremental_discovery(self,
-            log: EventLog,
-            log_completed_traces: EventLog = None,
-            verbose: bool = True,
-            ipmd: bool = True
-        ):
-
-        if not log_completed_traces:
-            self.online_discovery = True
-            self._first_incremental = True
-            self.prev_caseids = list(set(pm4py.convert_to_dataframe(log)["case:concept:name"]))
-            self.prev_log = log
-            self._firststep_incremental_discovery(log, verbose=verbose)
-
         else:
-            df_new_log = pm4py.convert_to_dataframe(log)
-            df_arrival = df_new_log[~df_new_log["case:concept:name"].isin(self.prev_caseids)]
-            log_arrivals = pm4py.convert_to_event_log(df_arrival)
-
-            if ipmd:
-                if verbose:
-                    print("Process Model Incremental Discovery...")
-                pt = pm4py.convert_to_process_tree(self.net, self.initial_marking, self.final_marking)        
-                for i in range(len(log)):
-                    try:
-                        pt = add_trace_to_pt_language(pt, self.prev_log, log[i])
-                    except:
-                        continue
-
-                self.net, self.initial_marking, self.final_marking = pm4py.convert_to_petri_net(pt)
-                # self.net, self.initial_marking, self.final_marking = pm4py.discover_petri_net_inductive(log_completed_traces)
-            self.net_transition_labels = list(set([t.label for t in self.net.transitions if t.label]))
-
-            for a in self.label_data_attributes_categorical:
-                values_a = list(pm4py.get_event_attribute_values(log, a).keys())
-                for v in values_a:
-                    if v not in self.attribute_values_label_categorical[a]:
-                        self.attribute_values_label_categorical[a].append(v)
-
-            if self.label_data_attributes:
-                
-                if verbose:
-                    print("Data attributes discovery...")
-                self.distribution_data_attributes = discover_attributes_distribution(EventLog(list(log_completed_traces)+list(log_arrivals)), self.label_data_attributes)
-
-            if verbose:
-                print("Transition probabilities discovery...")
-
-            self.transition_weights = incremental_transition_weights_learning(
-                                                                                None,
-                                                                                log_completed_traces,
-                                                                                self.net, 
-                                                                                self.initial_marking, 
-                                                                                self.final_marking,
-                                                                                self.net_transition_labels,
-                                                                                self.label_data_attributes,
-                                                                                self.label_data_attributes_categorical,
-                                                                                self.attribute_values_label_categorical,
-                                                                                self.mode_act_history,
-                                                                                grace_period=self.grace_period
-                                                                            )
-            
-            if verbose:
-                print("Calendars discovery...")
-            calendars = discover_res_calendars(log)
-
-            for r in calendars.keys():
-                self.calendars[r] = calendars[r]
-
-            self.arrival_calendar = discover_arrival_calendar(log_completed_traces)
-
-            if verbose:
-                print("Resources discovery...")
-            self.resources = list(pm4py.get_event_attribute_values(log, 'org:resource').keys())
-            act_resource_prob = discover_resource_acts_prob(log)
-            for a in act_resource_prob.keys():
-                if a not in self.act_resource_prob.keys():
-                    self.act_resource_prob[a] = act_resource_prob[a]
-                else:
-                    for r in act_resource_prob[a].keys():
-                        self.act_resource_prob[a][r] = act_resource_prob[a][r]
-                    for r in self.act_resource_prob[a].keys():
-                        if r not in act_resource_prob[a].keys():
-                            self.act_resource_prob[a][r] = 0
-
-            if verbose:
-                print("Execution Time discovery...")
-            self.execution_time_distributions, min_et, max_et = incremental_execution_time_learning(
-                                                                                        self.execution_time_distributions,
-                                                                                        log, 
-                                                                                        self.net_transition_labels, 
-                                                                                        self.calendars,
-                                                                                        self.label_data_attributes, 
-                                                                                        self.label_data_attributes_categorical, 
-                                                                                        self.attribute_values_label_categorical, 
-                                                                                        self.mode_act_history,
-                                                                                        grace_period=self.grace_period
-                                                                                    )
-            
-            if verbose:
+            self.waiting_time_distributions = discover_waiting_time(
+                                                                        df_features,
+                                                                        self.net_transition_labels,
+                                                                        self.resources, 
+                                                                        self.calendars, 
+                                                                        self.label_data_attributes, 
+                                                                        self.label_data_attributes_categorical, 
+                                                                        self.attribute_values_label_categorical, 
+                                                                        max_depths=max_depth_cv
+                                                                    )
+        
+        if verbose:
+            if incremental_discovery:
+                print("Incremental Arrival Time discovery...")
+            else:
                 print("Arrival Time discovery...")
-            self.arrival_time_distribution, self.min_at, self.max_at = incremental_model_arrival_learning(self.arrival_time_distribution, log_arrivals, self.arrival_calendar, grace_period=self.grace_period)
-            
-            if verbose:
-                print("Waiting Time discovery...")
-            self.waiting_time_distributions, min_wt, max_wt = incremental_waiting_time_learning(
-                                                                                    self.waiting_time_distributions,
-                                                                                    log, 
-                                                                                    self.calendars, 
-                                                                                    self.label_data_attributes, 
-                                                                                    self.label_data_attributes_categorical, 
-                                                                                    self.attribute_values_label_categorical,
-                                                                                    grace_period=self.grace_period
-                                                                                )
-            for r in min_wt.keys():
-                self.min_wt[r] = min_wt[r]
-                self.max_wt[r] = max_wt[r]
-
-            for a in min_et.keys():
-                self.min_et[a] = min_et[a]
-                self.max_et[a] = max_et[a]
-
-            self.prev_log = log_completed_traces
-            self._first_incremental = False
-            self.prev_caseids.extend(list(set(df_arrival["case:concept:name"])))
+        
+        if incremental_discovery:
+            self.arrival_time_distribution = incremental_model_arrival_learning(log, self.arrival_calendar, max_depth=max_depth_tree, grace_period=grace_period)
+        else:
+            self.arrival_time_distribution = discover_arrival_time(log, self.arrival_calendar, max_depths=max_depth_cv)
 
 
 
@@ -423,24 +271,10 @@ class SimulatorEngine:
                 else:
                     arrival_delta = sampled_arrivals[i]
             else:
-                if self.simulation_parameters.online_discovery:
-                    arrival_pred = self.simulation_parameters.arrival_time_distribution.debug_one({'hour': current_arr_ts.hour,'weekday': current_arr_ts.weekday()})
-                    if not arrival_pred:
-                        arrival_delta = self.simulation_parameters.arrival_time_distribution.predict_one({'hour': current_arr_ts.hour,'weekday': current_arr_ts.weekday()})
-                    else:
-                        pred_split = arrival_pred.split("\n")[-2].split(" | ")
-                        mean = float(pred_split[0][6:].replace(",", ""))
-                        var = float(pred_split[1][5:].replace(",", ""))
-                        arrival_delta = random.normalvariate(mean, math.sqrt(var))
-                        if arrival_delta < self.simulation_parameters.min_at:
-                            arrival_delta = mean
-                        elif arrival_delta > self.simulation_parameters.max_at:
-                            arrival_delta = mean
-                else:   
-                    if deterministic_time:
-                        arrival_delta = self.simulation_parameters.arrival_time_distribution.apply({'hour': current_arr_ts.hour,'weekday': current_arr_ts.weekday()})
-                    else:
-                        arrival_delta = self.simulation_parameters.arrival_time_distribution.apply_distribution({'hour': current_arr_ts.hour,'weekday': current_arr_ts.weekday()})
+                if deterministic_time:
+                    arrival_delta = self.simulation_parameters.arrival_time_distribution.apply({'hour': current_arr_ts.hour,'weekday': current_arr_ts.weekday()})
+                else:
+                    arrival_delta = self.simulation_parameters.arrival_time_distribution.apply_distribution({'hour': current_arr_ts.hour,'weekday': current_arr_ts.weekday()})
             if arrival_delta == 0:
                 arrival_delta = 1
             current_arr_ts = add_minutes_with_calendar(current_arr_ts, int(arrival_delta), self.simulation_parameters.arrival_calendar)
@@ -507,28 +341,14 @@ class SimulatorEngine:
                         else:
                             waiting_time = random.choice(sampled_waiting_times[resource])
                     else:
-                        if self.simulation_parameters.online_discovery:
-                            waiting_time_pred = self.simulation_parameters.waiting_time_distributions[resource].debug_one({'workload': r_workload} | case["history"] | case["attributes"])
-                            if not waiting_time_pred:
-                                waiting_time = self.simulation_parameters.waiting_time_distributions[resource].predict_one({'workload': r_workload} | case["history"] | case["attributes"])
-                            else:
-                                pred_split = waiting_time_pred.split("\n")[-2].split(" | ")
-                                mean = float(pred_split[0][6:].replace(",", ""))
-                                var = float(pred_split[1][5:].replace(",", ""))
-                                waiting_time = random.normalvariate(mean, math.sqrt(var))
-                                if waiting_time < self.simulation_parameters.min_wt[resource]:
-                                    waiting_time = mean
-                                elif waiting_time > self.simulation_parameters.max_wt[resource]:
-                                    waiting_time = mean
+                        if deterministic_time:
+                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply({'workload': r_workload} | case["history"] | case["attributes"])
+                            try:
+                                int(waiting_time)
+                            except:
+                                waiting_time = 0
                         else:
-                            if deterministic_time:
-                                waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply({'workload': r_workload} | case["history"] | case["attributes"])
-                                try:
-                                    int(waiting_time)
-                                except:
-                                    waiting_time = 0
-                            else:
-                                waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply_distribution({'workload': r_workload} | case["history"] | case["attributes"])
+                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply_distribution({'workload': r_workload} | case["history"] | case["attributes"])
 
                 t_start_exec = add_minutes_with_calendar(t_enabled, int(waiting_time), self.simulation_parameters.calendars[resource])
 
@@ -541,29 +361,15 @@ class SimulatorEngine:
                             ex_time = 0
                     else:
                         ex_time = random.choice(sampled_execution_times[activity])
-                else:
-                    if self.simulation_parameters.online_discovery:
-                        ex_time_pred = self.simulation_parameters.execution_time_distributions[activity].debug_one({'resource = '+res: (res == resource)*1 for res in self.simulation_parameters.resources} | case["history"] | case["attributes"])
-                        if not ex_time_pred:
-                            ex_time = self.simulation_parameters.execution_time_distributions[activity].predict_one({'resource = '+res: (res == resource)*1 for res in self.simulation_parameters.resources} | case["history"] | case["attributes"])
-                        else:
-                            pred_split = ex_time_pred.split("\n")[-2].split(" | ")
-                            mean = float(pred_split[0][6:].replace(",", ""))
-                            var = float(pred_split[1][5:].replace(",", ""))
-                            ex_time = random.normalvariate(mean, math.sqrt(var))
-                            if ex_time < self.simulation_parameters.min_et[activity]:
-                                ex_time = mean
-                            elif ex_time > self.simulation_parameters.max_et[activity]:
-                                ex_time = mean         
+                else:    
+                    if deterministic_time:
+                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply({'resource = '+res: (res == resource)*1 for res in self.simulation_parameters.resources} | case["history"] | case["attributes"])
+                        try:
+                            int(ex_time)
+                        except: 
+                            ex_time = 0
                     else:
-                        if deterministic_time:
-                            ex_time = self.simulation_parameters.execution_time_distributions[activity].apply({'resource = '+res: (res == resource)*1 for res in self.simulation_parameters.resources} | case["history"] | case["attributes"])
-                            try:
-                               int(ex_time)
-                            except: 
-                                ex_time = 0
-                        else:
-                            ex_time = self.simulation_parameters.execution_time_distributions[activity].apply_distribution({'resource = '+res: (res == resource)*1 for res in self.simulation_parameters.resources} | case["history"] | case["attributes"])
+                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply_distribution({'resource = '+res: (res == resource)*1 for res in self.simulation_parameters.resources} | case["history"] | case["attributes"])
 
                 
                 t_end = add_minutes_with_calendar(t_start_exec, int(ex_time), self.simulation_parameters.calendars[resource])
