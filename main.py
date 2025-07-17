@@ -41,10 +41,10 @@ CASE_STUDIES = {
 }
 
 N_SIM = 5
-OUTPUT_PATH = 'outputs_new'
-MAX_DEPTHS = [0, 1, 2, 3, 4, 5]
-NOISE_THRESHOLD_IM = 0.2
-METRICS = ["ngd", "car", "ctd", "car_entropy", "ctd_entropy", "etd_entropy"] 
+OUTPUT_PATH = 'outputs'
+MAX_DEPTH = 5
+NOISE_THRESHOLD_IM = 0.0
+METRICS = ["ngd", "car", "ctd", "etd_entropy"] 
 
 if __name__ == "__main__":
 
@@ -94,48 +94,48 @@ if __name__ == "__main__":
         pm4py.write_pnml(net, initial_marking, final_marking, OUTPUT_PATH+f'/{case_study}/model.pnml')
         
         evaluations = {"prob": dict(), "det": dict()}
-        for max_depth in MAX_DEPTHS:
-            df_sim_logs, df_sim_logs_det = discovery_and_simulate(
-                train_log,
-                net, initial_marking, final_marking,
-                max_depth=max_depth,
-                noise_threshold_im=CASE_STUDIES[case_study].get('NOISE_THRESHOLD_IM', NOISE_THRESHOLD_IM),
-                start_ts_simulation=df_test_log.iloc[0]['start:timestamp'],
-                n_sim_traces=n_sim_traces,
-                n_sim=N_SIM
-            )
 
-            for i in range(N_SIM):
-                df_sim_logs[i].to_csv(OUTPUT_PATH+f'/{case_study}/simulations/prob/df_sim_{i}_maxdepth_{max_depth}.csv', index=False)
-                df_sim_logs_det[i].to_csv(OUTPUT_PATH+f'/{case_study}/simulations/det/df_sim_{i}_maxdepth_{max_depth}.csv', index=False)
+        df_sim_logs, df_sim_logs_det = discovery_and_simulate(
+            train_log,
+            net, initial_marking, final_marking,
+            max_depth=MAX_DEPTH,
+            noise_threshold_im=CASE_STUDIES[case_study].get('NOISE_THRESHOLD_IM', NOISE_THRESHOLD_IM),
+            start_ts_simulation=df_test_log.iloc[0]['start:timestamp'],
+            n_sim_traces=n_sim_traces,
+            n_sim=N_SIM
+        )
 
-            print(f'EVALUATION WITH MAX DEPTH {max_depth}...')
+        for i in range(N_SIM):
+            df_sim_logs[i].to_csv(OUTPUT_PATH+f'/{case_study}/simulations/prob/df_sim_{i}_maxdepth_{MAX_DEPTH}.csv', index=False)
+            df_sim_logs_det[i].to_csv(OUTPUT_PATH+f'/{case_study}/simulations/det/df_sim_{i}_maxdepth_{MAX_DEPTH}.csv', index=False)
 
-            evaluations["prob"][f"maxdepth_{max_depth}"] = dict()
-            for i in range(N_SIM):
-                metrics = evaluate(df_test_log, df_sim_logs[i], metrics_labels=METRICS)
-                for metric in metrics.keys():
-                    if i == 0:
-                        evaluations["prob"][f"maxdepth_{max_depth}"][metric] = [metrics[metric]]
-                    else:
-                        evaluations["prob"][f"maxdepth_{max_depth}"][metric].append(metrics[metric])
+        print(f'EVALUATION WITH MAX DEPTH {MAX_DEPTH}...')
 
-            for metric in evaluations["prob"][f"maxdepth_{max_depth}"].keys():
-                print(metric, ': ', np.mean(evaluations["prob"][f"maxdepth_{max_depth}"][metric]))
-            
-            print(f'EVALUATION WITH MAX DEPTH {max_depth} (DETERMINISTIC)...')
+        evaluations["prob"][f"maxdepth_{MAX_DEPTH}"] = dict()
+        for i in range(N_SIM):
+            metrics = evaluate(df_test_log, df_sim_logs[i], metrics_labels=METRICS)
+            for metric in metrics.keys():
+                if i == 0:
+                    evaluations["prob"][f"maxdepth_{MAX_DEPTH}"][metric] = [metrics[metric]]
+                else:
+                    evaluations["prob"][f"maxdepth_{MAX_DEPTH}"][metric].append(metrics[metric])
 
-            evaluations["det"][f"maxdepth_{max_depth}"] = dict()
-            for i in range(N_SIM):
-                metrics = evaluate(df_test_log, df_sim_logs_det[i], METRICS)
-                for metric in metrics.keys():
-                    if i == 0:
-                        evaluations["det"][f"maxdepth_{max_depth}"][metric] = [metrics[metric]]
-                    else:
-                        evaluations["det"][f"maxdepth_{max_depth}"][metric].append(metrics[metric])
+        for metric in evaluations["prob"][f"maxdepth_{MAX_DEPTH}"].keys():
+            print(metric, ': ', np.mean(evaluations["prob"][f"maxdepth_{MAX_DEPTH}"][metric]))
+        
+        print(f'EVALUATION WITH MAX DEPTH {MAX_DEPTH} (DETERMINISTIC)...')
 
-            for metric in evaluations["det"][f"maxdepth_{max_depth}"].keys():
-                print(metric, ': ', np.mean(evaluations["det"][f"maxdepth_{max_depth}"][metric]))
+        evaluations["det"][f"maxdepth_{MAX_DEPTH}"] = dict()
+        for i in range(N_SIM):
+            metrics = evaluate(df_test_log, df_sim_logs_det[i], METRICS)
+            for metric in metrics.keys():
+                if i == 0:
+                    evaluations["det"][f"maxdepth_{MAX_DEPTH}"][metric] = [metrics[metric]]
+                else:
+                    evaluations["det"][f"maxdepth_{MAX_DEPTH}"][metric].append(metrics[metric])
+
+        for metric in evaluations["det"][f"maxdepth_{MAX_DEPTH}"].keys():
+            print(metric, ': ', np.mean(evaluations["det"][f"maxdepth_{MAX_DEPTH}"][metric]))
 
         with open(OUTPUT_PATH+f'/{case_study}/'+f"distances.json", 'w') as f:
             json.dump(evaluations, f)
