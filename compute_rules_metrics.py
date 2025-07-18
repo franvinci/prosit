@@ -43,7 +43,7 @@ CASE_STUDIES = {
 }
 
 CONVERT_IDS = {
-    "simod_im": {
+    "simod": {
         "case_id": "case:concept:name",
         "activity": "concept:name",
         "resource": "org:resource",
