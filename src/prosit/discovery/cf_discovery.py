@@ -91,6 +91,9 @@ def build_models(
             clf_t = DecisionRules()
             clf_t.from_decision_tree(clf_t_dtc)
 
+        if clf_t is None:
+            clf_t = float(y.mode().iloc[0])
+
         models_t[t] = clf_t
     
     return models_t
