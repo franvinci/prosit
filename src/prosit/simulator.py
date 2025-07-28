@@ -350,7 +350,6 @@ class SimulatorEngine:
                     resource = return_resource(resource_weights, enabled_resources)
                     t_enabled_waited = t_enabled
                 r_workload = workloads[resource]
-                case["res_history"][resource] += 1
                 
                 if sum(case["history"].values()) == 0:
                     waiting_time = 0
