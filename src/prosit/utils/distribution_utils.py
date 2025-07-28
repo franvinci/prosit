@@ -17,7 +17,7 @@ def fit_distribution(data: any, dist_name: str) -> tuple:
     
     params= dist.fit(data)
     
-    generated_values = sampling_from_dist(dist, params, min(data), max(data), np.median(data), n_sample=len(data))
+    generated_values = sampling_from_dist(dist, params, min(data), max(data), np.mean(data), n_sample=len(data))
     wass_distance = stats.wasserstein_distance(data, generated_values)
     
     return params, wass_distance, dist
@@ -81,3 +81,13 @@ def plot_distribution(data: any, params: tuple, dist: any):
     plt.legend()
     plt.title(f"Fitted {dist.name.capitalize()} Distribution")
     plt.show()
+
+
+def remove_outliers(data: list, m: float = 20.0) -> list:
+
+    data = np.asarray(data)
+    d = np.abs(data - np.median(data))
+    mdev = np.median(d)
+    s = d / (mdev if mdev else 1.0)
+    
+    return data[s < m].tolist()

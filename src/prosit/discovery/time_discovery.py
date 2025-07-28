@@ -9,7 +9,7 @@ from sklearn.model_selection import GridSearchCV
 from pm4py.objects.log.obj import EventLog
 
 from prosit.utils.common_utils import count_false_hours
-from prosit.utils.distribution_utils import return_best_distribution, sampling_from_dist
+from prosit.utils.distribution_utils import return_best_distribution, sampling_from_dist, remove_outliers
 from prosit.utils.rule_utils import DecisionRules
 
 
@@ -136,6 +136,7 @@ def build_model_arrival(
     leaves = list(y_leaf['Leaf'].unique())
     for l in leaves:
         y = y_leaf[y_leaf['Leaf']==l]['Y']
+        y = remove_outliers(y)
         min_value = np.min(y)
         max_value = np.max(y)
         dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
@@ -209,6 +210,7 @@ def build_models_ex(
         leaves = list(y_leaf['Leaf'].unique())
         for l in leaves:
             y = y_leaf[y_leaf['Leaf']==l]['Y']
+            y = remove_outliers(y)
             min_value = np.min(y)
             max_value = np.max(y)
             dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
@@ -281,6 +283,7 @@ def build_models_wt(
         leaves = list(y_leaf['Leaf'].unique())
         for l in leaves:
             y = y_leaf[y_leaf['Leaf']==l]['Y']
+            y = remove_outliers(y)
             min_value = np.min(y)
             max_value = np.max(y)
             dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
@@ -386,6 +389,7 @@ def find_best_distribution_arrival(log: EventLog,
     arrival_times = []
     for i in range(1, len(ordered_first_ts_list)):
         arrival_times.append(max((ordered_first_ts_list[i] - ordered_first_ts_list[i-1]).total_seconds()/60 - count_false_hours(calendar_arrival, ordered_first_ts_list[i-1], ordered_first_ts_list[i])*60, 0))
+    arrival_times = remove_outliers(arrival_times)
 
     dist, params = return_best_distribution(arrival_times, dist_search=DIST_SEARCH)
     min_value = np.min(arrival_times)
@@ -409,6 +413,7 @@ def find_best_distribution_ex(df_features: pd.DataFrame,
         df_act = df_et[df_et['transition_label'] == act]
 
         exec_times = df_act['execution_time'].dropna().tolist()
+        exec_times = remove_outliers(exec_times)
 
         dist, params = return_best_distribution(exec_times, dist_search=DIST_SEARCH)
         if len(exec_times) == 0:
@@ -443,6 +448,7 @@ def find_best_distribution_wt(df_features: pd.DataFrame,
     for res in resources:
         df_res = df_wt[df_wt['resource'] == res]
         waiting_times = df_res['waiting_time'].dropna().tolist()
+        waiting_times = remove_outliers(waiting_times)
 
         if len(waiting_times) == 0:
             dist = 'fixed'

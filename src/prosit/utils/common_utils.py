@@ -123,9 +123,23 @@ def compute_transition_weights_from_model(models_t: dict, dict_x: dict) -> dict:
                 transition_weights[t] = 0
         elif type(models_t[t]) == DecisionRules:
             transition_weights[t] = models_t[t].apply(dict_x)
+        elif type(models_t[t]) == float:
+            transition_weights[t] = models_t[t] 
         else:
             transition_weights[t] = 1
     return transition_weights
+
+
+def return_resource(resource_weights: dict, enabled_resources: list) -> str:
+
+    total_weight = sum(resource_weights[s] for s in enabled_resources)
+    random_value = random.uniform(0, total_weight)
+    
+    cumulative_weight = 0
+    for s in enabled_resources:
+        cumulative_weight += resource_weights[s]
+        if random_value <= cumulative_weight:
+            return s
 
 
 def compute_proba(models_t: dict, t: PetriNet.Transition, X:pd.DataFrame) -> float:
@@ -188,7 +202,7 @@ def get_transition_from_name(t_fired_name: str, net: PetriNet) -> PetriNet.Trans
             return t
         
 
-def build_df_features(log, net, im, fm, net_transition_labels, label_data_attributes=[]):
+def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels, label_data_attributes=[]):
 
     df_log = pm4py.convert_to_dataframe(log)
     df_log["start:timestamp"] = df_log["start:timestamp"].apply(lambda x: datetime.fromisoformat(str(x)[:-6]).timestamp())
@@ -238,6 +252,7 @@ def build_df_features(log, net, im, fm, net_transition_labels, label_data_attrib
                 current_t = end_t
                 df_log_filtered = df_log[(df_log["time:timestamp"] > enabled_t.timestamp()) & (df_log["start:timestamp"] < enabled_t.timestamp())]
                 res_workload = (df_log_filtered['org:resource']==resource).sum()
+                prev_enabled_resources = act_to_resources[transition_label]
                 j += 1
             else: # model move
                 resource = None
@@ -245,16 +260,17 @@ def build_df_features(log, net, im, fm, net_transition_labels, label_data_attrib
                 start_t = None
                 end_t = None
                 res_workload = None
+                prev_enabled_resources = None
 
             del transition_enabled_times[transition]
             
             marking = update_current_marking(marking, transition)
 
-            dataset.append((case_id, transition, transition_label, resource, enabled_t, start_t, end_t, prev_enabled_transitions, res_workload) + tuple(trace_attributes) + tuple(history.values()))
+            dataset.append((case_id, transition, transition_label, resource, enabled_t, start_t, end_t, prev_enabled_transitions, prev_enabled_resources, res_workload) + tuple(trace_attributes) + tuple(history.values()))
             
             if transition_label:
                 history[transition_label] += 1
 
-    df = pd.DataFrame(dataset, columns=["case_id", "transition", "transition_label", "resource", "enabled_t", "start_t", "end_t", "prev_enabled_transitions", "res_workload"] + label_data_attributes + net_transition_labels)
+    df = pd.DataFrame(dataset, columns=["case_id", "transition", "transition_label", "resource", "enabled_t", "start_t", "end_t", "prev_enabled_transitions", "prev_enabled_resources", "res_workload"] + label_data_attributes + net_transition_labels)
 
     return df

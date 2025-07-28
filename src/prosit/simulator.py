@@ -12,7 +12,7 @@ from pm4py.objects.log.obj import EventLog
 from prosit.discovery.cf_discovery import discover_weight_transitions
 from prosit.discovery.time_discovery import discover_execution_time_distributions, discover_arrival_time, discover_waiting_time
 from prosit.discovery.calendar_discovery import discover_res_calendars, discover_arrival_calendar
-from prosit.discovery.resource_discovery import discover_resources_list, discover_resource_acts_prob
+from prosit.discovery.resource_discovery import discover_resources_list, return_multitasking_resources, discover_resources_per_act, discover_weight_resources
 from prosit.discovery.data_discovery import discover_attributes_distribution, return_label_data_attributes
 from prosit.discovery.online_discovery.cf_discovery import incremental_transition_weights_learning
 from prosit.discovery.online_discovery.time_discovery import incremental_execution_time_learning, incremental_model_arrival_learning, incremental_waiting_time_learning
@@ -23,7 +23,8 @@ from prosit.utils.common_utils import (
     count_concurrent_events,
     compute_transition_weights_from_model, 
     add_minutes_with_calendar,
-    build_df_features
+    build_df_features,
+    return_resource
     )
 from prosit.utils.distribution_utils import sampling_from_dist
 
@@ -54,7 +55,8 @@ class SimulatorParameters:
 
         self.transition_weights: dict = {t: 1 for t in list(self.net.transitions)}
         self.resources: list = ['auto']
-        self.act_resource_prob: dict = {act: {"auto": 1} for act in self.net_transition_labels}
+        self.resource_weights: dict = {"auto": 1}
+        self.act_to_resources: dict = {act: [r for r in self.resources] for act in self.net_transition_labels}
         self.calendars: dict = {'auto': {wd: {h: True for h in range(24)} for wd in range(7)}}
         self.arrival_calendar: dict = {wd: {h: True for h in range(24)} for wd in range(7)}
 
@@ -87,6 +89,11 @@ class SimulatorParameters:
         for a in self.label_data_attributes_categorical:
             self.attribute_values_label_categorical[a] = list(pm4py.get_event_attribute_values(log, a).keys())
 
+        if verbose:
+            print("Resources discovery...")
+        self.resources = discover_resources_list(log)
+        self.act_to_resources = discover_resources_per_act(log, self.net_transition_labels, self.resources)
+
         if self.label_data_attributes:
             if verbose:
                 print("Data attributes discovery...")
@@ -94,7 +101,10 @@ class SimulatorParameters:
 
         if verbose:
             print("Feature discovery...")
-        df_features = build_df_features(log, self.net, self.initial_marking, self.final_marking, self.net_transition_labels, self.label_data_attributes)
+        df_features = build_df_features(log, self.net, self.initial_marking, self.final_marking, self.act_to_resources, self.net_transition_labels, self.resources, self.label_data_attributes)
+        df_features = df_features[df_features['resource'].isin(self.resources)]
+        df_features.reset_index(drop=True, inplace=True)
+        self.multitasking_resources = return_multitasking_resources(df_features)
 
         if verbose:
             if incremental_discovery:
@@ -126,11 +136,10 @@ class SimulatorParameters:
                 self.transition_weights[t] = 0
 
         if verbose:
-            print("Resources discovery...")
-        self.resources = discover_resources_list(log)
-        self.act_resource_prob = discover_resource_acts_prob(log, self.resources)
-        df_features = df_features[df_features['resource'].isin(self.resources)]
-        df_features.reset_index(drop=True, inplace=True)
+            print("Resource Weights discovery...")
+
+        else:
+            self.resource_weights = discover_weight_resources(df_features, self.resources)
 
         if verbose:
             print("Calendars discovery...")
@@ -323,10 +332,25 @@ class SimulatorEngine:
             t_enabled = case["enabled"][chosen_transition]
 
             if activity is not None:
-                resources = list(self.simulation_parameters.act_resource_prob[activity].keys())
-                resource_weights = list(self.simulation_parameters.act_resource_prob[activity].values())
-                resource = random.choices(resources, weights=resource_weights, k=1)[0]
-                r_workload = count_concurrent_events(resource_schedule[resource], t_enabled)
+                workloads = {r: count_concurrent_events(resource_schedule[r], t_enabled) for r in self.simulation_parameters.resources}
+                enabled_resources_act = self.simulation_parameters.act_to_resources[activity]
+                enabled_resources = []
+                for r in enabled_resources_act:
+                    if workloads[r] == 0:
+                        enabled_resources.append(r)
+                    else:
+                        if r in self.simulation_parameters.multitasking_resources:
+                            enabled_resources.append(r)
+                if not enabled_resources:
+                    t_enabled_enabled_resources = [resource_schedule[r][-1][-1] for r in enabled_resources_act]
+                    index_res, t_enabled_waited = min(enumerate(t_enabled_enabled_resources), key=lambda x: x[1])
+                    resource = enabled_resources_act[index_res]
+                else:
+                    resource_weights = self.simulation_parameters.resource_weights
+                    resource = return_resource(resource_weights, enabled_resources)
+                    t_enabled_waited = t_enabled
+                r_workload = workloads[resource]
+                case["res_history"][resource] += 1
                 
                 if sum(case["history"].values()) == 0:
                     waiting_time = 0
@@ -350,7 +374,9 @@ class SimulatorEngine:
                         else:
                             waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply_distribution({'workload': r_workload} | case["history"] | case["attributes"])
 
-                t_start_exec = add_minutes_with_calendar(t_enabled, int(waiting_time), self.simulation_parameters.calendars[resource])
+                waiting_time -= (t_enabled_waited - t_enabled).total_seconds() / 60
+                waiting_time = max(0, waiting_time)
+                t_start_exec = add_minutes_with_calendar(t_enabled_waited, int(waiting_time), self.simulation_parameters.calendars[resource])
 
                 if not self.simulation_parameters.rules_mode:
                     if deterministic_time:
