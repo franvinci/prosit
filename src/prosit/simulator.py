@@ -15,7 +15,7 @@ from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
 from prosit.discovery.cf_discovery import discover_weight_transitions
 from prosit.discovery.time_discovery import discover_execution_time_distributions, discover_arrival_time, discover_waiting_time
 from prosit.discovery.calendar_discovery import discover_res_calendars, discover_arrival_calendar
-from prosit.discovery.resource_discovery import discover_resources_list, return_multitasking_resources, discover_resources_per_act, discover_weight_resources
+from prosit.discovery.resource_discovery import discover_resources_list, return_multitasking_resources, discover_resource_acts_prob, discover_resources_per_act, discover_weight_resources
 from prosit.discovery.data_discovery import discover_attributes_distribution, return_label_data_attributes
 from prosit.discovery.online_discovery.cf_discovery import incremental_transition_weights_learning
 from prosit.discovery.online_discovery.time_discovery import incremental_execution_time_learning, incremental_model_arrival_learning, incremental_waiting_time_learning
@@ -30,6 +30,9 @@ from prosit.utils.common_utils import (
     return_resource
     )
 from prosit.utils.distribution_utils import sampling_from_dist
+from prosit.utils.save_and_load_utils import decision_rules_to_dict, transition_to_name, convert_calendar_names, dict_to_decrules, name_to_transition, fromstr_to_scipy
+
+import json
 
 
 class SimulatorParameters:
@@ -58,8 +61,8 @@ class SimulatorParameters:
 
         self.transition_weights: dict = {t: 1 for t in list(self.net.transitions)}
         self.resources: list = ['auto']
-        self.resource_weights: dict = {"auto": 1}
-        self.act_to_resources: dict = {act: [r for r in self.resources] for act in self.net_transition_labels}
+        self.act_resource_prob: dict = {act: {"auto": 1} for act in self.net_transition_labels}
+        self.multitasking_resources: list = []
         self.calendars: dict = {'auto': {wd: {h: True for h in range(24)} for wd in range(7)}}
         self.arrival_calendar: dict = {wd: {h: True for h in range(24)} for wd in range(7)}
 
@@ -95,17 +98,19 @@ class SimulatorParameters:
         if verbose:
             print("Resources discovery...")
         self.resources = discover_resources_list(log)
-        self.act_to_resources = discover_resources_per_act(log, self.net_transition_labels, self.resources)
+        self.act_resource_prob = discover_resource_acts_prob(log, self.resources)
 
         if self.label_data_attributes:
             if verbose:
                 print("Data attributes discovery...")
             self.distribution_data_attributes = discover_attributes_distribution(log, self.label_data_attributes)
+        else:
+            self.distribution_data_attributes = None
 
         if verbose:
             print("Feature discovery...")
-        df_features = build_df_features(log, self.net, self.initial_marking, self.final_marking, self.act_to_resources, self.net_transition_labels, self.resources, self.label_data_attributes)
-        df_features = df_features[df_features['resource'].isin(self.resources)]
+        df_features = build_df_features(log, self.net, self.initial_marking, self.final_marking, self.act_resource_prob, self.net_transition_labels, self.resources, self.label_data_attributes)
+        df_features = df_features[(df_features['resource'].isin(self.resources)) | (df_features["resource"].isna())]
         df_features.reset_index(drop=True, inplace=True)
         self.multitasking_resources = return_multitasking_resources(df_features)
 
@@ -137,12 +142,6 @@ class SimulatorParameters:
         for t in self.net.transitions:
             if t not in self.transition_weights.keys():
                 self.transition_weights[t] = 0
-
-        if verbose:
-            print("Resource Weights discovery...")
-
-        else:
-            self.resource_weights = discover_weight_resources(df_features, self.resources)
 
         if verbose:
             print("Calendars discovery...")
@@ -218,6 +217,84 @@ class SimulatorParameters:
             self.arrival_time_distribution = incremental_model_arrival_learning(log, self.arrival_calendar, max_depth=max_depth_tree, grace_period=grace_period)
         else:
             self.arrival_time_distribution = discover_arrival_time(log, self.arrival_calendar, max_depths=max_depth_cv)
+
+
+    def to_dict(self) ->  dict:
+
+        dict_params = {
+
+            "transition_params": {
+                "transition_weights": {transition_to_name(t): decision_rules_to_dict(dr) for t, dr in self.transition_weights.items()} # ok
+                },
+
+            "resource_params": {
+                "resources" : self.resources,
+                "resource_probabilities": self.act_resource_prob,
+                "multitasking_resource": self.multitasking_resources,
+                "calendars": {r: convert_calendar_names(cal) for r, cal in self.calendars.items()}
+                },
+
+            "arrival_params": {
+                "arrival_calendar": convert_calendar_names(self.arrival_calendar),
+                "arrival_time_distributions": decision_rules_to_dict(self.arrival_time_distribution)
+                },
+
+            "execution_time_params": {
+                "execution_time_distributions": {a: decision_rules_to_dict(dr) for a, dr in self.execution_time_distributions.items()} 
+                },
+
+            "waiting_time_params": {
+                "waiting_time_distributions": {r: decision_rules_to_dict(dr) for r, dr in self.waiting_time_distributions.items()} 
+                },
+
+            "data_attribute_params": {
+                "label_data_attributes": self.label_data_attributes,
+                "label_data_attributes_categorical": self.label_data_attributes_categorical,
+                "attribute_values_label_categorical": self.attribute_values_label_categorical,
+                "distribution_data_attributes": self.distribution_data_attributes
+                }
+
+        }
+
+        return dict_params
+
+    def to_json(self, path: str = "simulator_params.json"):
+
+        dict_params = self.to_dict()
+        with open(path, "w") as json_file:
+            json.dump(dict_params, json_file, indent=4)
+
+
+    def from_dict(self, dict_params):
+
+        self.rules_mode = "mean_value" not in dict_params["arrival_params"]["arrival_time_distributions"].keys()
+        self.label_data_attributes, self.label_data_attributes_categorical = dict_params["data_attribute_params"]["label_data_attributes"], dict_params["data_attribute_params"]["label_data_attributes_categorical"]
+        self.attribute_values_label_categorical = dict_params["data_attribute_params"]["attribute_values_label_categorical"]
+        self.distribution_data_attributes = dict_params["data_attribute_params"]["distribution_data_attributes"]
+
+        self.resources = dict_params["resource_params"]["resources"]
+        self.act_resource_prob = dict_params["resource_params"]["resource_probabilities"]
+        self.multitasking_resources = dict_params["resource_params"]["multitasking_resource"]
+
+        self.calendars = {r: convert_calendar_names(cal, to_number=True) for r, cal in dict_params["resource_params"]["calendars"].items()}
+        self.arrival_calendar = convert_calendar_names(dict_params["arrival_params"]["arrival_calendar"], to_number=True)
+
+        if self.rules_mode:
+            self.transition_weights = {name_to_transition(t_name, self.net): dict_to_decrules(value) for t_name, value in dict_params["transition_params"]["transition_weights"].items()}
+            self.execution_time_distributions = {act: dict_to_decrules(value) for act, value in dict_params["execution_time_params"]["execution_time_distributions"].items()}
+            self.waiting_time_distributions = {res: dict_to_decrules(value) for res, value in dict_params["waiting_time_params"]["waiting_time_distributions"].items()}
+            self.arrival_time_distribution = dict_to_decrules(dict_params["arrival_params"]["arrival_time_distributions"])
+        else:
+            self.transition_weights = {name_to_transition(t_name, self.net): value for t_name, value in dict_params["transition_params"]["transition_weights"].items()}  
+            self.execution_time_distributions = {act: (fromstr_to_scipy(value["dist_name"]), tuple(value["params"]), value["min_value"], value["max_value"], value["mean_value"]) for act, value in dict_params["execution_time_params"]["execution_time_distributions"].items()}
+            self.waiting_time_distributions = {res: (fromstr_to_scipy(value["dist_name"]), tuple(value["params"]), value["min_value"], value["max_value"], value["mean_value"]) for res, value in dict_params["waiting_time_params"]["waiting_time_distributions"].items()}
+            self.arrival_time_distribution = (fromstr_to_scipy(dict_params["arrival_params"]["arrival_time_distributions"]["dist_name"]), tuple(dict_params["arrival_params"]["arrival_time_distributions"]["params"]), dict_params["arrival_params"]["arrival_time_distributions"]["min_value"], dict_params["arrival_params"]["arrival_time_distributions"]["max_value"], dict_params["arrival_params"]["arrival_time_distributions"]["mean_value"])
+
+    def from_json(self, path: str = "simulator_params.json"):
+        
+        with open(path, "r") as file:
+            dict_params = json.load(file)
+        self.from_dict(dict_params)
 
 
 
@@ -454,7 +531,7 @@ class SimulatorEngine:
                     r_workload = count_concurrent_events(resource_schedule[resource], t_enabled)
                 else:
                     workloads = {r: count_concurrent_events(resource_schedule[r], t_enabled) for r in self.simulation_parameters.resources}
-                    enabled_resources_act = self.simulation_parameters.act_to_resources[activity]
+                    enabled_resources_act = [r for r, v in self.simulation_parameters.act_resource_prob[activity].items() if v>0]
                     enabled_resources = []
                     for r in enabled_resources_act:
                         if workloads[r] == 0:
@@ -467,10 +544,10 @@ class SimulatorEngine:
                         index_res, t_enabled_waited = min(enumerate(t_enabled_enabled_resources), key=lambda x: x[1])
                         resource = enabled_resources_act[index_res]
                     else:
-                        resource_weights = self.simulation_parameters.resource_weights
+                        resource_weights = self.simulation_parameters.act_resource_prob[activity]
                         resource = return_resource(resource_weights, enabled_resources)
                         t_enabled_waited = t_enabled
-                        r_workload = workloads[resource]
+                    r_workload = workloads[resource]
                 
                 if sum(case["history"].values()) == 0:
                     waiting_time = 0

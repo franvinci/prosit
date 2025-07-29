@@ -11,7 +11,7 @@ def fit_distribution(data: any, dist_name: str) -> tuple:
         generated_values = np.array([params] * len(data))
         wass_distance = stats.wasserstein_distance(data, generated_values)
 
-        return params, wass_distance, 'fixed'
+        return (params,), wass_distance, 'fixed'
 
     dist = getattr(stats, dist_name)
     
@@ -31,11 +31,11 @@ def return_best_distribution(data: any, dist_search: list = ['fixed', 'norm', 'e
 
     if len(set(data)) == 1:
         if type(data) == list:
-            return 'fixed', data[0]
+            return 'fixed', (data[0],)
         else:
-            return 'fixed', data.iloc[0]
+            return 'fixed', (data.iloc[0],)
     if len(data) == 0:
-        return 'fixed', 0
+        return 'fixed', (0,)
 
     for dist_name in dist_search:
 
@@ -58,7 +58,7 @@ def sampling_from_dist(
     ) -> np.array:
 
     if dist == 'fixed':
-        return np.array([max_value] * n_sample)
+        return np.array([mean_value] * n_sample)
 
     l = dist.rvs(*params, n_sample)
     l[l < min_value] = mean_value
