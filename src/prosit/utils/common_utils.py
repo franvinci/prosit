@@ -142,6 +142,18 @@ def return_resource(resource_weights: dict, enabled_resources: list) -> str:
             return s
 
 
+def compute_resource_weights_from_model(models_r: dict, enabled_resources: list, dict_x: dict) -> dict:
+    resource_weights = dict()
+    for r in enabled_resources:
+        if type(models_r[r]) == DecisionRules:
+            resource_weights[r] = models_r[r].apply(dict_x)
+        elif type(models_r[r]) == float:
+            resource_weights[r] = models_r[r]
+        else:
+            resource_weights[r] = 0
+    return resource_weights
+
+
 def compute_proba(models_t: dict, t: PetriNet.Transition, X:pd.DataFrame) -> float:
     
     clf_t = models_t[t]
@@ -202,7 +214,7 @@ def get_transition_from_name(t_fired_name: str, net: PetriNet) -> PetriNet.Trans
             return t
         
 
-def build_df_features(log, net, im, fm, act_to_resources_prob, net_transition_labels, resources, label_data_attributes=[]):
+def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels, resources, label_data_attributes=[]):
 
     df_log = pm4py.convert_to_dataframe(log)
     df_log["start:timestamp"] = df_log["start:timestamp"].apply(lambda x: datetime.fromisoformat(str(x)[:-6]).timestamp())
@@ -211,8 +223,6 @@ def build_df_features(log, net, im, fm, act_to_resources_prob, net_transition_la
 
     aligned_traces = alignments.apply_log(log, net, im, fm, parameters={"ret_tuple_as_trans_desc": True})
 
-    act_to_resources = {act: [r for r, v in act_to_resources_prob[act].items() if v>0] for act in net_transition_labels}
-
     dataset = []
     for i, trace in enumerate(tqdm(log)):
 
@@ -220,6 +230,7 @@ def build_df_features(log, net, im, fm, act_to_resources_prob, net_transition_la
 
         case_id = trace[0]["case:concept:name"]
         history = {t_l: 0 for t_l in net_transition_labels}
+        history_res = {r: 0 for r in resources}
         if label_data_attributes:
             try:
                 trace_attributes = [trace[a] for a in label_data_attributes]
@@ -268,11 +279,13 @@ def build_df_features(log, net, im, fm, act_to_resources_prob, net_transition_la
             
             marking = update_current_marking(marking, transition)
 
-            dataset.append((case_id, transition, transition_label, resource, enabled_t, start_t, end_t, prev_enabled_transitions, prev_enabled_resources, res_workload) + tuple(trace_attributes) + tuple(history.values()))
+            dataset.append((case_id, transition, transition_label, resource, enabled_t, start_t, end_t, prev_enabled_transitions, prev_enabled_resources, res_workload) + tuple(trace_attributes) + tuple(history_res.values()) + tuple(history.values()))
             
             if transition_label:
                 history[transition_label] += 1
+                if resource in resources:
+                    history_res[resource] += 1
 
-    df = pd.DataFrame(dataset, columns=["case_id", "transition", "transition_label", "resource", "enabled_t", "start_t", "end_t", "prev_enabled_transitions", "prev_enabled_resources", "res_workload"] + label_data_attributes + net_transition_labels)
+    df = pd.DataFrame(dataset, columns=["case_id", "transition", "transition_label", "resource", "enabled_t", "start_t", "end_t", "prev_enabled_transitions", "prev_enabled_resources", "res_workload"] + label_data_attributes + resources + net_transition_labels)
 
     return df

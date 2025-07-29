@@ -12,10 +12,11 @@ from pm4py.objects.log.obj import EventLog
 from prosit.discovery.cf_discovery import discover_weight_transitions
 from prosit.discovery.time_discovery import discover_execution_time_distributions, discover_arrival_time, discover_waiting_time
 from prosit.discovery.calendar_discovery import discover_res_calendars, discover_arrival_calendar
-from prosit.discovery.resource_discovery import discover_resources_list, return_multitasking_resources, discover_resource_acts_prob, discover_resources_per_act, discover_weight_resources
+from prosit.discovery.resource_discovery import discover_resources_list, return_multitasking_resources, discover_resources_per_act, discover_weight_resources
 from prosit.discovery.data_discovery import discover_attributes_distribution, return_label_data_attributes
 from prosit.discovery.online_discovery.cf_discovery import incremental_transition_weights_learning
 from prosit.discovery.online_discovery.time_discovery import incremental_execution_time_learning, incremental_model_arrival_learning, incremental_waiting_time_learning
+from prosit.discovery.online_discovery.resource_discovery import incremental_resource_weights_learning
 from prosit.utils.common_utils import (
     return_enabled_transitions, 
     update_current_marking, 
@@ -24,7 +25,8 @@ from prosit.utils.common_utils import (
     compute_transition_weights_from_model, 
     add_minutes_with_calendar,
     build_df_features,
-    return_resource
+    return_resource,
+    compute_resource_weights_from_model
     )
 from prosit.utils.distribution_utils import sampling_from_dist
 from prosit.utils.save_and_load_utils import decision_rules_to_dict, transition_to_name, convert_calendar_names, dict_to_decrules, name_to_transition, fromstr_to_scipy
@@ -58,7 +60,8 @@ class SimulatorParameters:
 
         self.transition_weights: dict = {t: 1 for t in list(self.net.transitions)}
         self.resources: list = ['auto']
-        self.act_resource_prob: dict = {act: {"auto": 1} for act in self.net_transition_labels}
+        self.resource_weights: dict = {"auto": 1}
+        self.act_to_resources: dict = {act: [r for r in self.resources] for act in self.net_transition_labels} 
         self.multitasking_resources: list = []
         self.calendars: dict = {'auto': {wd: {h: True for h in range(24)} for wd in range(7)}}
         self.arrival_calendar: dict = {wd: {h: True for h in range(24)} for wd in range(7)}
@@ -95,7 +98,7 @@ class SimulatorParameters:
         if verbose:
             print("Resources discovery...")
         self.resources = discover_resources_list(log)
-        self.act_resource_prob = discover_resource_acts_prob(log, self.resources)
+        self.act_to_resources = discover_resources_per_act(log, self.net_transition_labels, self.resources)
 
         if self.label_data_attributes:
             if verbose:
@@ -106,7 +109,7 @@ class SimulatorParameters:
 
         if verbose:
             print("Feature discovery...")
-        df_features = build_df_features(log, self.net, self.initial_marking, self.final_marking, self.act_resource_prob, self.net_transition_labels, self.resources, self.label_data_attributes)
+        df_features = build_df_features(log, self.net, self.initial_marking, self.final_marking, self.act_to_resources, self.net_transition_labels, self.resources, self.label_data_attributes)
         df_features = df_features[(df_features['resource'].isin(self.resources)) | (df_features["resource"].isna())]
         df_features.reset_index(drop=True, inplace=True)
         self.multitasking_resources = return_multitasking_resources(df_features)
@@ -139,6 +142,35 @@ class SimulatorParameters:
         for t in self.net.transitions:
             if t not in self.transition_weights.keys():
                 self.transition_weights[t] = 0
+
+        if verbose:
+            if incremental_discovery:
+                print("Incremental Resource Weights discovery...")
+            else:
+                print("Resource Weights discovery...")
+
+
+        if incremental_discovery:
+            self.resource_weights = incremental_resource_weights_learning(
+                                                                            df_features,
+                                                                            self.net_transition_labels,
+                                                                            self.resources,
+                                                                            max_depth_tree,
+                                                                            grace_period,
+                                                                            self.label_data_attributes, 
+                                                                            self.label_data_attributes_categorical, 
+                                                                            self.attribute_values_label_categorical
+                                                                        )
+        else:
+            self.resource_weights = discover_weight_resources(
+                                                                df_features,
+                                                                self.net_transition_labels,
+                                                                self.resources,
+                                                                max_depth_cv,
+                                                                self.label_data_attributes, 
+                                                                self.label_data_attributes_categorical, 
+                                                                self.attribute_values_label_categorical
+                                                            )
 
         if verbose:
             print("Calendars discovery...")
@@ -226,8 +258,9 @@ class SimulatorParameters:
 
             "resource_params": {
                 "resources" : self.resources,
-                "resource_probabilities": self.act_resource_prob,
                 "multitasking_resource": self.multitasking_resources,
+                "act_to_resources": self.act_to_resources,
+                "resource_weights": {r: decision_rules_to_dict(dr) for r, dr in self.resource_weights.items()},
                 "calendars": {r: convert_calendar_names(cal) for r, cal in self.calendars.items()}
                 },
 
@@ -270,7 +303,8 @@ class SimulatorParameters:
         self.distribution_data_attributes = dict_params["data_attribute_params"]["distribution_data_attributes"]
 
         self.resources = dict_params["resource_params"]["resources"]
-        self.act_resource_prob = dict_params["resource_params"]["resource_probabilities"]
+        self.act_to_resources = dict_params["resource_params"]["act_to_resources"]
+        self.resource_weights = {res: dict_to_decrules(value) for res, value in dict_params["resource_params"]["resource_weights"].items()}
         self.multitasking_resources = dict_params["resource_params"]["multitasking_resource"]
 
         self.calendars = {r: convert_calendar_names(cal, to_number=True) for r, cal in dict_params["resource_params"]["calendars"].items()}
@@ -372,6 +406,7 @@ class SimulatorEngine:
                 "place_token_time": {},
                 "enabled": {},
                 "history": {t: 0 for t in self.simulation_parameters.net_transition_labels},
+                "res_history": {r: 0 for r in self.simulation_parameters.resources},
                 "attributes": trace_attributes
             }
             for place in self.net.places:
@@ -410,7 +445,7 @@ class SimulatorEngine:
 
             if activity is not None:
                 workloads = {r: count_concurrent_events(resource_schedule[r], t_enabled) for r in self.simulation_parameters.resources}
-                enabled_resources_act = [r for r, v in self.simulation_parameters.act_resource_prob[activity].items() if v>0]
+                enabled_resources_act = self.simulation_parameters.act_to_resources[activity]
                 enabled_resources = []
                 for r in enabled_resources_act:
                     if workloads[r] == 0:
@@ -423,10 +458,14 @@ class SimulatorEngine:
                     index_res, t_enabled_waited = min(enumerate(t_enabled_enabled_resources), key=lambda x: x[1])
                     resource = enabled_resources_act[index_res]
                 else:
-                    resource_weights = self.simulation_parameters.act_resource_prob[activity]
+                    if not self.simulation_parameters.rules_mode:
+                        resource_weights = self.simulation_parameters.resource_weights
+                    else:
+                        resource_weights = compute_resource_weights_from_model(self.simulation_parameters.resource_weights, enabled_resources, case["res_history"] | case["attributes"] | case["history"])
                     resource = return_resource(resource_weights, enabled_resources)
                     t_enabled_waited = t_enabled
                 r_workload = workloads[resource]
+                case["res_history"][resource] += 1
                 
                 if sum(case["history"].values()) == 0:
                     waiting_time = 0
