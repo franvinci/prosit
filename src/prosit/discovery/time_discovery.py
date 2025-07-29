@@ -141,7 +141,7 @@ def build_model_arrival(
         max_value = np.max(y)
         dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
         sampled = sampling_from_dist(dist, params, min_value, max_value, clf.rules[l]['value'], n_sample=max(len(y), 1000))
-        clf.rules[l]['dist'] = dist, params
+        clf.rules[l]['dist'] = dist, params, min_value, max_value
         clf.rules[l]['sampled'] = list(sampled)
 
     return clf
@@ -215,7 +215,7 @@ def build_models_ex(
             max_value = np.max(y)
             dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
             sampled = sampling_from_dist(dist, params, min_value, max_value, clf.rules[l]["value"], n_sample=max(len(y), 1000))
-            clf.rules[l]['dist'] = dist, params
+            clf.rules[l]['dist'] = dist, params, min_value, max_value
             clf.rules[l]['sampled'] = list(sampled)
 
         models_act[act] = clf
@@ -288,7 +288,7 @@ def build_models_wt(
             max_value = np.max(y)
             dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
             sampled = sampling_from_dist(dist, params, min_value, max_value, clf.rules[l]["value"], n_sample=max(len(y), 1000))
-            clf.rules[l]['dist'] = dist, params
+            clf.rules[l]['dist'] = dist, params, min_value, max_value
             clf.rules[l]['sampled'] = list(sampled)
         
         models_res[res] = clf

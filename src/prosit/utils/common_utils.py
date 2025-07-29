@@ -202,7 +202,7 @@ def get_transition_from_name(t_fired_name: str, net: PetriNet) -> PetriNet.Trans
             return t
         
 
-def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels, label_data_attributes=[]):
+def build_df_features(log, net, im, fm, act_to_resources_prob, net_transition_labels, resources, label_data_attributes=[]):
 
     df_log = pm4py.convert_to_dataframe(log)
     df_log["start:timestamp"] = df_log["start:timestamp"].apply(lambda x: datetime.fromisoformat(str(x)[:-6]).timestamp())
@@ -210,6 +210,8 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
 
 
     aligned_traces = alignments.apply_log(log, net, im, fm, parameters={"ret_tuple_as_trans_desc": True})
+
+    act_to_resources = {act: [r for r, v in act_to_resources_prob[act].items() if v>0] for act in net_transition_labels}
 
     dataset = []
     for i, trace in enumerate(tqdm(log)):

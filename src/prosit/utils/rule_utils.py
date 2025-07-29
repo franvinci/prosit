@@ -5,6 +5,7 @@ import graphviz
 import random
 import numpy as np
 import pandas as pd
+import scipy.stats as stats
 
 def build_graph_vis(model_t, model_distributions=False):
 
@@ -131,7 +132,7 @@ def transform_river_decision_tree_data(decision_tree, distribution=True, min_val
 
     if decision_tree.height == 0:
         if distribution:
-            return {0: {'value': 0, 'sampled': [0]}}
+            return {0: {'value': 0, 'sampled': [0], 'dist': ("fixed", (0,), 0, 0)}}
         else:
             return {0: {"value": 1}}
 
@@ -154,7 +155,7 @@ def transform_river_decision_tree_data(decision_tree, distribution=True, min_val
                 sampled_values[sampled_values > max_value] = value
                 sampled_values = sampled_values.tolist()
 
-            return {0: {'value': value, 'sampled': sampled_values}}
+            return {0: {'value': value, 'sampled': sampled_values, 'dist': (getattr(stats, "norm"), (value, std_dev), min_value, max_value)}}
         else:
             value = decision_tree.predict_proba_one({})[1]
             return {0: {"value": value}}
@@ -214,7 +215,8 @@ def transform_river_decision_tree_data(decision_tree, distribution=True, min_val
 
                 transformed_data[node_id] = {
                     'value': value,
-                    'sampled': sampled_values
+                    'sampled': sampled_values,
+                    'dist': (getattr(stats, "norm"), (value, std_dev), min_value, max_value)
                 }
             else:
                 value = row['stats'][1]/(row['stats'][0]+row['stats'][1])
