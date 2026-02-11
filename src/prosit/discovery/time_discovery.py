@@ -113,13 +113,13 @@ def build_model_arrival(
 
     if max_depths:
         if len(X)>3:
-            clf_mean = DecisionTreeRegressor(random_state=72)
+            clf_mean = DecisionTreeRegressor(random_state=72, min_samples_leaf=100, min_samples_split=200)
             grid_search = GridSearchCV(estimator=clf_mean, param_grid=param_grid, cv=3).fit(X, y)
             clf_mean = grid_search.best_estimator_
         else:
-            clf_mean = DecisionTreeRegressor(max_depth=1, random_state=72).fit(X, y)
+            clf_mean = DecisionTreeRegressor(max_depth=1, random_state=72, min_samples_leaf=100, min_samples_split=200).fit(X, y)
     else:
-        clf_mean = DecisionTreeRegressor(random_state=72, max_depth=5)
+        clf_mean = DecisionTreeRegressor(random_state=72, max_depth=5, min_samples_leaf=100, min_samples_split=200)
         clf_mean.fit(X, y)
 
 
@@ -188,13 +188,13 @@ def build_models_ex(
 
         if max_depths:
             if len(X)>3:
-                clf_mean = DecisionTreeRegressor(random_state=72)
+                clf_mean = DecisionTreeRegressor(random_state=72, min_samples_leaf=100, min_samples_split=200)
                 grid_search = GridSearchCV(estimator=clf_mean, param_grid=param_grid, cv=3).fit(X, y)
                 clf_mean = grid_search.best_estimator_
             else:
-                clf_mean = DecisionTreeRegressor(max_depth=1, random_state=72).fit(X, y)
+                clf_mean = DecisionTreeRegressor(max_depth=1, random_state=72, min_samples_leaf=100, min_samples_split=200).fit(X, y)
         else:
-            clf_mean = DecisionTreeRegressor(random_state=72, max_depth=5)
+            clf_mean = DecisionTreeRegressor(random_state=72, max_depth=5, min_samples_leaf=100, min_samples_split=200)
             clf_mean.fit(X, y)
 
         leaf_indices = clf_mean.apply(X)
@@ -261,13 +261,13 @@ def build_models_wt(
 
         if max_depths:
             if len(X)>3:
-                clf_mean = DecisionTreeRegressor(random_state=72)
+                clf_mean = DecisionTreeRegressor(random_state=72, min_samples_leaf=100, min_samples_split=200)
                 grid_search = GridSearchCV(estimator=clf_mean, param_grid=param_grid, cv=3).fit(X, y)
                 clf_mean = grid_search.best_estimator_
             else:
-                clf_mean = DecisionTreeRegressor(max_depth=1, random_state=72).fit(X, y)
+                clf_mean = DecisionTreeRegressor(max_depth=1, random_state=72, min_samples_leaf=100, min_samples_split=200).fit(X, y)
         else:
-            clf_mean = DecisionTreeRegressor(max_depth=5, random_state=72)
+            clf_mean = DecisionTreeRegressor(max_depth=5, random_state=72, min_samples_leaf=100, min_samples_split=200)
             clf_mean.fit(X, y)
 
         leaf_indices = clf_mean.apply(X)

@@ -276,3 +276,52 @@ def build_df_features(log, net, im, fm, act_to_resources_prob, net_transition_la
     df = pd.DataFrame(dataset, columns=["case_id", "transition", "transition_label", "resource", "enabled_t", "start_t", "end_t", "prev_enabled_transitions", "prev_enabled_resources", "res_workload"] + label_data_attributes + net_transition_labels)
 
     return df
+
+
+def explore_invisible_path_to_activity(net, current_marking, target_activity, max_depth=10):
+    """
+    Use BFS to find the shortest path through invisible transitions to reach a target activity.
+    
+    Args:
+        net: The Petri net
+        current_marking: Current marking of the case
+        target_activity: The label of the activity we want to reach
+        max_depth: Maximum depth for searching (to avoid infinite loops)
+    
+    Returns:
+        List of invisible transitions to fire in order, or None if no path found
+    """
+    from collections import deque
+    
+    # BFS to find shortest path through invisible transitions
+    queue = deque([(current_marking, [])])
+    visited = set()
+    visited.add(frozenset(current_marking.items()))
+    
+    while queue:
+        marking, path = queue.popleft()
+        
+        # Check if we've exceeded max depth
+        if len(path) >= max_depth:
+            continue
+        
+        # Get enabled transitions from this marking
+        enabled = return_enabled_transitions(net, marking)
+        
+        # Check if target activity is now directly enabled
+        for t in enabled:
+            if t.label == target_activity:
+                return path  # Found a path!
+        
+        # Explore only invisible transitions
+        for t in enabled:
+            if t.label is None:  # Invisible transition
+                # Simulate firing this transition
+                new_marking = update_current_marking(marking, t)
+                marking_key = frozenset(new_marking.items())
+                
+                if marking_key not in visited:
+                    visited.add(marking_key)
+                    queue.append((new_marking, path + [t]))
+    
+    return None  # No path found
