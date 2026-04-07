@@ -1,7 +1,6 @@
 from prosit.utils.rule_utils import DecisionRules
 from pm4py.objects.petri_net.obj import PetriNet
 import copy
-from prosit.utils.distribution_utils import sampling_from_dist
 import scipy.stats as stats
 
 
@@ -97,11 +96,10 @@ def dict_to_decrules(d: dict) -> DecisionRules:
                     new_k = k
                     try:
                         new_k = int(k)
-                    except:
+                    except (ValueError, TypeError):
                         pass
                 if k == "dist":
                     new_obj[k] = fromstr_to_scipy(obj[k]["dist_name"]), tuple(obj[k]["params"]), obj[k]["min_value"], obj[k]["max_value"]
-                    new_obj["sampled"] = sampling_from_dist(new_obj[k][0], new_obj[k][1], new_obj[k][2], new_obj[k][3], new_obj["value"])
                 else:
                     new_obj[new_k] = convert(v)
             return new_obj

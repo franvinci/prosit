@@ -8,54 +8,61 @@ from sklearn.model_selection import GridSearchCV
 
 from pm4py.objects.log.obj import EventLog
 
-from prosit.utils.common_utils import count_false_hours
+from prosit.utils.common_utils import count_working_minutes, calendar_to_working_set
 from prosit.utils.distribution_utils import return_best_distribution, sampling_from_dist, remove_outliers
 from prosit.utils.rule_utils import DecisionRules
 
 
-DIST_SEARCH = ['fixed', 'norm', 'expon', 'lognorm', 'uniform']
+DIST_SEARCH = ['fixed', 'norm', 'expon', 'lognorm', 'gamma', 'uniform']
+DEFAULT_SAMPLE_SIZE = 1000
 
 
 # DISCOVERY
 
 def discover_arrival_time(
-        log: EventLog, 
-        calendar_arrival: dict, 
-        max_depths: list = range(1,6)
+        log: EventLog,
+        calendar_arrival: dict,
+        max_depths: list = range(1,6),
+        min_samples_leaf_cv: list = [5, 10, 20, 30],
+        random_state: int = 72
     ) -> DecisionRules:
 
     if not max_depths:
         arrival_time_distr = find_best_distribution_arrival(log, calendar_arrival)
     else:
-        arrival_time_distr = build_model_arrival(log, calendar_arrival, max_depths)
+        arrival_time_distr = build_model_arrival(log, calendar_arrival, max_depths, min_samples_leaf_cv, random_state=random_state)
 
     return arrival_time_distr
 
 
 
 def discover_execution_time_distributions(
-        df_features: pd.DataFrame, 
+        df_features: pd.DataFrame,
         net_transition_labels: list,
-        resources: list, 
-        calendars: dict, 
+        resources: list,
+        calendars: dict,
         max_depths: list = range(1,6),
-        label_data_attributes: list = [], 
-        label_data_attributes_categorical: list = [], 
+        min_samples_leaf_cv: list = [5, 10, 20, 30],
+        label_data_attributes: list = [],
+        label_data_attributes_categorical: list = [],
         values_categorical: dict = dict(),
+        random_state: int = 72
     ) -> dict:
 
     if not max_depths:
         activity_exec_time_distributions = find_best_distribution_ex(df_features, net_transition_labels, calendars)
     else:
         activity_exec_time_distributions = build_models_ex(
-                                                            df_features, 
+                                                            df_features,
                                                             net_transition_labels,
                                                             resources,
                                                             calendars,
-                                                            label_data_attributes, 
-                                                            label_data_attributes_categorical, 
-                                                            values_categorical, 
-                                                            max_depths
+                                                            label_data_attributes,
+                                                            label_data_attributes_categorical,
+                                                            values_categorical,
+                                                            max_depths,
+                                                            min_samples_leaf_cv,
+                                                            random_state=random_state
                                                         )
 
     return activity_exec_time_distributions
@@ -64,27 +71,31 @@ def discover_execution_time_distributions(
 
 def discover_waiting_time(
         df_features: pd.DataFrame,
-        net_transition_labels: list, 
+        net_transition_labels: list,
         resources: list,
-        calendars: dict, 
-        label_data_attributes: list, 
-        label_data_attributes_categorical: list, 
-        values_categorical: dict, 
-        max_depths: list = range(1,6)
+        calendars: dict,
+        label_data_attributes: list,
+        label_data_attributes_categorical: list,
+        values_categorical: dict,
+        max_depths: list = range(1,6),
+        min_samples_leaf_cv: list = [5, 10, 20, 30],
+        random_state: int = 72
     ) -> dict:
 
     if not max_depths:
         res_waiting_time_distributions = find_best_distribution_wt(df_features, resources, calendars)
     else:
         res_waiting_time_distributions = build_models_wt(
-                                                            df_features, 
+                                                            df_features,
                                                             net_transition_labels,
                                                             resources,
-                                                            calendars, 
-                                                            label_data_attributes, 
-                                                            label_data_attributes_categorical, 
-                                                            values_categorical, 
-                                                            max_depths
+                                                            calendars,
+                                                            label_data_attributes,
+                                                            label_data_attributes_categorical,
+                                                            values_categorical,
+                                                            max_depths,
+                                                            min_samples_leaf_cv,
+                                                            random_state=random_state
                                                         )
 
     return res_waiting_time_distributions
@@ -93,205 +104,123 @@ def discover_waiting_time(
 
 # BUILD ML MODELS
 
-def build_model_arrival(
-        log: EventLog, 
-        calendar_arrival: dict, 
-        max_depths: list = range(1,6)
-    ) -> DecisionRules:
-
-    param_grid = {'max_depth': max_depths}
-
-    df = build_training_df_arrival(log, calendar_arrival)
-
-    X = df.drop(columns=['arrival_time'])
-    y = df['arrival_time']
-
+def _fit_decision_rules(X, y, param_grid, max_depths, random_state) -> DecisionRules:
     if len(X) == 0:
         clf = DecisionRules()
-        clf.rules = {0: {'value': 0.0, 'sampled':[0], 'dist': ('fixed', (0,))}}
+        clf.rules = {0: {'value': 0.0, 'sampled': [0], 'dist': ('fixed', (0,))}}
         return clf
 
     if max_depths:
-        if len(X)>3:
-            clf_mean = DecisionTreeRegressor(random_state=72)
+        if len(X) > 3:
+            clf_mean = DecisionTreeRegressor(random_state=random_state)
             grid_search = GridSearchCV(estimator=clf_mean, param_grid=param_grid, cv=3).fit(X, y)
             clf_mean = grid_search.best_estimator_
         else:
-            clf_mean = DecisionTreeRegressor(max_depth=1, random_state=72).fit(X, y)
+            clf_mean = DecisionTreeRegressor(max_depth=1, random_state=random_state).fit(X, y)
     else:
-        clf_mean = DecisionTreeRegressor(random_state=72, max_depth=5)
+        clf_mean = DecisionTreeRegressor(max_depth=5, random_state=random_state)
         clf_mean.fit(X, y)
 
-
     leaf_indices = clf_mean.apply(X)
-
-    y_leaf = pd.DataFrame({
-        'Leaf': leaf_indices,
-        'Y': y
-    })
+    y_leaf = pd.DataFrame({'Leaf': leaf_indices, 'Y': y})
 
     clf = DecisionRules()
     clf.from_decision_tree(clf_mean)
 
-    leaves = list(y_leaf['Leaf'].unique())
-    for l in leaves:
-        y = y_leaf[y_leaf['Leaf']==l]['Y']
-        y = remove_outliers(y)
-        min_value = np.min(y)
-        max_value = np.max(y)
-        dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
-        sampled = sampling_from_dist(dist, params, min_value, max_value, clf.rules[l]['value'], n_sample=max(len(y), 1000))
+    for l in y_leaf['Leaf'].unique():
+        y_l = remove_outliers(y_leaf[y_leaf['Leaf'] == l]['Y'])
+        min_value = np.min(y_l)
+        max_value = np.max(y_l)
+        dist, params = return_best_distribution(y_l, dist_search=DIST_SEARCH)
+        sampled = sampling_from_dist(dist, params, min_value, max_value, clf.rules[l]['value'], n_sample=max(len(y_l), DEFAULT_SAMPLE_SIZE))
         clf.rules[l]['dist'] = dist, params, min_value, max_value
         clf.rules[l]['sampled'] = list(sampled)
 
     return clf
 
 
+def build_model_arrival(
+        log: EventLog,
+        calendar_arrival: dict,
+        max_depths: list = range(1,6),
+        min_samples_leaf_cv: list = [5, 10, 20, 30],
+        random_state: int = 72
+    ) -> DecisionRules:
+
+    param_grid = {'max_depth': max_depths, 'min_samples_leaf': min_samples_leaf_cv}
+    df = build_training_df_arrival(log, calendar_arrival)
+    X = df.drop(columns=['arrival_time'])
+    y = df['arrival_time']
+    return _fit_decision_rules(X, y, param_grid, max_depths, random_state)
+
+
 
 def build_models_ex(
-        df_features: pd.DataFrame, 
+        df_features: pd.DataFrame,
         activity_labels: list,
         resources: list,
         calendars: dict,
-        label_data_attributes: list, 
-        label_data_attributes_categorical: list, 
-        values_categorical: dict, 
-        max_depths: list = range(1,6)
+        label_data_attributes: list,
+        label_data_attributes_categorical: list,
+        values_categorical: dict,
+        max_depths: list = range(1,6),
+        min_samples_leaf_cv: list = [5, 10, 20, 30],
+        random_state: int = 72
     ) -> dict:
 
     df = build_training_df_ex(
                                 df_features,
-                                resources, 
-                                activity_labels, 
+                                resources,
+                                activity_labels,
                                 calendars,
-                                label_data_attributes, 
-                                label_data_attributes_categorical, 
+                                label_data_attributes,
+                                label_data_attributes_categorical,
                                 values_categorical
                             )
-    
-    param_grid = {'max_depth': max_depths}
 
+    param_grid = {'max_depth': max_depths, 'min_samples_leaf': min_samples_leaf_cv}
     models_act = dict()
-    
+
     for act in tqdm(activity_labels):
-
-        df_act = df[df['activity_executed'] == act].iloc[:,1:]
-
+        df_act = df[df['activity_executed'] == act].iloc[:, 1:]
         X = df_act.drop(columns=['execution_time'])
         y = df_act['execution_time']
-
-        if len(X) == 0:
-            clf = DecisionRules()
-            clf.rules = {0: {'value': 0.0, 'sampled':[0], 'dist': ('fixed', (0,))}}
-            models_act[act] = clf
-            continue
-
-        if max_depths:
-            if len(X)>3:
-                clf_mean = DecisionTreeRegressor(random_state=72)
-                grid_search = GridSearchCV(estimator=clf_mean, param_grid=param_grid, cv=3).fit(X, y)
-                clf_mean = grid_search.best_estimator_
-            else:
-                clf_mean = DecisionTreeRegressor(max_depth=1, random_state=72).fit(X, y)
-        else:
-            clf_mean = DecisionTreeRegressor(random_state=72, max_depth=5)
-            clf_mean.fit(X, y)
-
-        leaf_indices = clf_mean.apply(X)
-
-        y_leaf = pd.DataFrame({
-            'Leaf': leaf_indices,
-            'Y': y
-        })
-
-        clf = DecisionRules()
-        clf.from_decision_tree(clf_mean)
-
-        leaves = list(y_leaf['Leaf'].unique())
-        for l in leaves:
-            y = y_leaf[y_leaf['Leaf']==l]['Y']
-            y = remove_outliers(y)
-            min_value = np.min(y)
-            max_value = np.max(y)
-            dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
-            sampled = sampling_from_dist(dist, params, min_value, max_value, clf.rules[l]["value"], n_sample=max(len(y), 1000))
-            clf.rules[l]['dist'] = dist, params, min_value, max_value
-            clf.rules[l]['sampled'] = list(sampled)
-
-        models_act[act] = clf
+        models_act[act] = _fit_decision_rules(X, y, param_grid, max_depths, random_state)
 
     return models_act
 
 
 
 def build_models_wt(
-        df_features: pd.DataFrame, 
+        df_features: pd.DataFrame,
         activity_labels: list,
         resources: list,
-        calendars: dict, 
-        label_data_attributes: list, 
-        label_data_attributes_categorical: list, 
-        values_categorical: dict, 
-        max_depths: list = range(1,6)
+        calendars: dict,
+        label_data_attributes: list,
+        label_data_attributes_categorical: list,
+        values_categorical: dict,
+        max_depths: list = range(1,6),
+        min_samples_leaf_cv: list = [5, 10, 20, 30],
+        random_state: int = 72
     ) -> dict:
 
     df = build_training_df_wt(
                                 df_features,
                                 activity_labels,
-                                calendars, 
+                                calendars,
                                 label_data_attributes,
                                 label_data_attributes_categorical,
                                 values_categorical
-                            )       
+                            )
 
-    param_grid = {'max_depth': max_depths}
-
+    param_grid = {'max_depth': max_depths, 'min_samples_leaf': min_samples_leaf_cv}
     models_res = dict()
-    for res in tqdm(resources):
-        df_res = df[df['resource'] == res].iloc[:,1:]
 
+    for res in tqdm(resources):
+        df_res = df[df['resource'] == res].iloc[:, 1:]
         X = df_res.drop(columns=['waiting_time'])
         y = df_res['waiting_time']
-
-        if len(X) == 0:
-            clf = DecisionRules()
-            clf.rules = {0: {'value': 0.0, 'sampled':[0], 'dist': ('fixed', (0,))}}
-            models_res[res] = clf
-            continue
-
-        if max_depths:
-            if len(X)>3:
-                clf_mean = DecisionTreeRegressor(random_state=72)
-                grid_search = GridSearchCV(estimator=clf_mean, param_grid=param_grid, cv=3).fit(X, y)
-                clf_mean = grid_search.best_estimator_
-            else:
-                clf_mean = DecisionTreeRegressor(max_depth=1, random_state=72).fit(X, y)
-        else:
-            clf_mean = DecisionTreeRegressor(max_depth=5, random_state=72)
-            clf_mean.fit(X, y)
-
-        leaf_indices = clf_mean.apply(X)
-
-        y_leaf = pd.DataFrame({
-            'Leaf': leaf_indices,
-            'Y': y
-        })
-
-        clf = DecisionRules()
-        clf.from_decision_tree(clf_mean)
-
-        leaves = list(y_leaf['Leaf'].unique())
-        for l in leaves:
-            y = y_leaf[y_leaf['Leaf']==l]['Y']
-            y = remove_outliers(y)
-            min_value = np.min(y)
-            max_value = np.max(y)
-            dist, params = return_best_distribution(y, dist_search=DIST_SEARCH)
-            sampled = sampling_from_dist(dist, params, min_value, max_value, clf.rules[l]["value"], n_sample=max(len(y), 1000))
-            clf.rules[l]['dist'] = dist, params, min_value, max_value
-            clf.rules[l]['sampled'] = list(sampled)
-        
-        models_res[res] = clf
+        models_res[res] = _fit_decision_rules(X, y, param_grid, max_depths, random_state)
 
     return models_res
 
@@ -308,12 +237,15 @@ def build_training_df_arrival(
     first_ts = df_log.groupby('case:concept:name')["start:timestamp"].min()
     ordered_first_ts_list = first_ts.sort_values().tolist()
 
-    dict_df = {'hour': []} | {'weekday': []} | {'arrival_time': []}
+    dict_df = {'hour': [], 'weekday': [], 'arrival_time': []}
+    arrival_working_set = calendar_to_working_set(calendar_arrival)
 
     for i in range(1, len(ordered_first_ts_list)):
-        dict_df['hour'].append(ordered_first_ts_list[i-1].hour)
-        dict_df['weekday'].append(ordered_first_ts_list[i-1].weekday())
-        dict_df['arrival_time'].append(max((ordered_first_ts_list[i] - ordered_first_ts_list[i-1]).total_seconds()/60 - count_false_hours(calendar_arrival, ordered_first_ts_list[i-1], ordered_first_ts_list[i])*60, 0))
+        hour = ordered_first_ts_list[i-1].hour
+        weekday = ordered_first_ts_list[i-1].weekday()
+        dict_df['hour'].append(hour)
+        dict_df['weekday'].append(weekday)
+        dict_df['arrival_time'].append(count_working_minutes(ordered_first_ts_list[i-1], ordered_first_ts_list[i], calendar_arrival, arrival_working_set))
 
     df = pd.DataFrame(dict_df)
 
@@ -333,7 +265,8 @@ def build_training_df_ex(
     
     df_et = df_features[["transition_label", "resource", "start_t", "end_t"] + label_data_attributes + activity_labels]
     df_et = df_et[~df_et["start_t"].isna()]
-    df_et["execution_time"] = df_et.apply(lambda x: max((x["end_t"] - x["start_t"]).total_seconds()/60 - count_false_hours(calendars[x["resource"]], x["start_t"], x["end_t"])*60, 0), axis=1)
+    working_sets_ex = {r: calendar_to_working_set(calendars[r]) for r in calendars}
+    df_et["execution_time"] = df_et.apply(lambda x: count_working_minutes(x["start_t"], x["end_t"], calendars[x["resource"]], working_sets_ex[x["resource"]]), axis=1)
     df_et.drop(columns=["start_t", "end_t"], inplace=True)
     df_et.rename(columns={"transition_label": "activity_executed"}, inplace=True)
     df_et.reset_index(drop=True, inplace=True)
@@ -360,12 +293,17 @@ def build_training_df_wt(
         values_categorical: dict
     ) -> dict:
 
-    df_wt = df_features[["resource", "start_t", "enabled_t", "res_workload"] + label_data_attributes + net_transition_labels]
+    df_wt = df_features[["resource", "transition_label", "start_t", "resource_free_t", "res_workload"] + label_data_attributes + net_transition_labels]
     df_wt = df_wt[~df_wt["start_t"].isna()]
-    df_wt["waiting_time"] = df_wt.apply(lambda x: max((x["start_t"] - x["enabled_t"]).total_seconds()/60 - count_false_hours(calendars[x["resource"]], x["enabled_t"], x["start_t"])*60, 0), axis=1)
-    df_wt.drop(columns=["start_t", "enabled_t"], inplace=True)
+    working_sets_wt = {r: calendar_to_working_set(calendars[r]) for r in calendars}
+    df_wt["waiting_time"] = df_wt.apply(lambda x: count_working_minutes(x["resource_free_t"], x["start_t"], calendars[x["resource"]], working_sets_wt[x["resource"]]), axis=1)
+    df_wt.drop(columns=["start_t", "resource_free_t"], inplace=True)
     df_wt.rename(columns={"res_workload": "workload"}, inplace=True)
     df_wt.reset_index(drop=True, inplace=True)
+
+    for act in net_transition_labels:
+        df_wt['waiting_activity = ' + act] = (df_wt['transition_label'] == act).astype(int)
+    df_wt.drop(columns=["transition_label"], inplace=True)
 
     for a in label_data_attributes_categorical:
         for v in values_categorical[a]:
@@ -387,8 +325,9 @@ def find_best_distribution_arrival(log: EventLog,
     ordered_first_ts_list = first_ts.sort_values().tolist()
 
     arrival_times = []
+    arrival_working_set2 = calendar_to_working_set(calendar_arrival)
     for i in range(1, len(ordered_first_ts_list)):
-        arrival_times.append(max((ordered_first_ts_list[i] - ordered_first_ts_list[i-1]).total_seconds()/60 - count_false_hours(calendar_arrival, ordered_first_ts_list[i-1], ordered_first_ts_list[i])*60, 0))
+        arrival_times.append(count_working_minutes(ordered_first_ts_list[i-1], ordered_first_ts_list[i], calendar_arrival, arrival_working_set2))
     arrival_times = remove_outliers(arrival_times)
 
     dist, params = return_best_distribution(arrival_times, dist_search=DIST_SEARCH)
@@ -405,7 +344,8 @@ def find_best_distribution_ex(df_features: pd.DataFrame,
 
     df_et = df_features[["transition_label", "resource", "start_t", "end_t"]]
     df_et = df_et[~df_et["start_t"].isna()]
-    df_et["execution_time"] = df_et.apply(lambda x: max((x["end_t"] - x["start_t"]).total_seconds()/60 - count_false_hours(calendars[x["resource"]], x["start_t"], x["end_t"])*60, 0), axis=1)
+    working_sets_ex2 = {r: calendar_to_working_set(calendars[r]) for r in calendars}
+    df_et["execution_time"] = df_et.apply(lambda x: count_working_minutes(x["start_t"], x["end_t"], calendars[x["resource"]], working_sets_ex2[x["resource"]]), axis=1)
 
     activity_exec_time_distributions = dict()
 
@@ -415,7 +355,6 @@ def find_best_distribution_ex(df_features: pd.DataFrame,
         exec_times = df_act['execution_time'].dropna().tolist()
         exec_times = remove_outliers(exec_times)
 
-        dist, params = return_best_distribution(exec_times, dist_search=DIST_SEARCH)
         if len(exec_times) == 0:
             dist = 'fixed'
             params = (0,)
@@ -438,9 +377,10 @@ def find_best_distribution_wt(df_features: pd.DataFrame,
         calendars: dict
     ) -> dict:
 
-    df_wt = df_features[["resource", "start_t", "enabled_t"]]
+    df_wt = df_features[["resource", "start_t", "resource_free_t"]]
     df_wt = df_wt[~df_wt["start_t"].isna()]
-    df_wt["waiting_time"] = df_wt.apply(lambda x: max((x["start_t"] - x["enabled_t"]).total_seconds()/60 - count_false_hours(calendars[x["resource"]], x["enabled_t"], x["start_t"])*60, 0), axis=1)
+    working_sets_wt2 = {r: calendar_to_working_set(calendars[r]) for r in calendars}
+    df_wt["waiting_time"] = df_wt.apply(lambda x: count_working_minutes(x["resource_free_t"], x["start_t"], calendars[x["resource"]], working_sets_wt2[x["resource"]]), axis=1)
     df_wt.reset_index(drop=True, inplace=True)
 
     res_waiting_time_distributions = dict()

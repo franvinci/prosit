@@ -1,11 +1,14 @@
 import re
-from prosit.utils.distribution_utils import sampling_from_dist
 from sklearn.tree import export_graphviz
 import graphviz
 import random
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
+
+MAX_DURATION_MINUTES = 60 * 24  # 1440 minutes = 24 hours
+DEFAULT_SAMPLE_SIZE = 1000
+
 
 def build_graph_vis(model_t, model_distributions=False):
 
@@ -17,8 +20,8 @@ def build_graph_vis(model_t, model_distributions=False):
                 rounded=True,
                 impurity=False,
                 proportion=True)
-    except:
-        dot_data = export_graphviz(model_t, 
+    except Exception:
+        dot_data = export_graphviz(model_t,
                 feature_names=model_t.feature_names_in_,
                 label='none',
                 rounded=True,
@@ -67,7 +70,7 @@ def parse_tree(dot_string):
         else:
             try:
                 nodes[node_id] = {'value': float(label_info[0])}  # Leaf node with a value
-            except:
+            except ValueError:
                 nodes[node_id] = {'value': (int(label_info[0][1:-1].split(', ')[0]), int(label_info[0][1:-1].split(', ')[1]))}
     for match in re.findall(edge_pattern, dot_string):
         parent, child = int(match[0]), int(match[1])
@@ -111,12 +114,22 @@ def traverse_tree(tree, features):
 
     return tree[current_node]['value']
 
+def _ensure_sampled(node):
+    """Lazy-generate sampled values from the distribution if not yet present."""
+    if 'sampled' not in node and 'dist' in node:
+        from prosit.utils.distribution_utils import sampling_from_dist
+        dist_tuple = node['dist']
+        node['sampled'] = list(sampling_from_dist(
+            dist_tuple[0], dist_tuple[1], dist_tuple[2], dist_tuple[3],
+            node['value'], n_sample=DEFAULT_SAMPLE_SIZE
+        ))
+
 def traverse_tree_distribution(tree, features):
 
     if type(tree) != dict:
         return random.choice(tree)
 
-    current_node = 0 
+    current_node = 0
     while 'value' not in tree[current_node]:
         feature = tree[current_node]['feature']
         threshold = tree[current_node]['threshold']
@@ -125,10 +138,11 @@ def traverse_tree_distribution(tree, features):
         else:
             current_node = tree[current_node]['children'][False]
 
+    _ensure_sampled(tree[current_node])
     return random.choice(tree[current_node]['sampled'])
 
 
-def transform_river_decision_tree_data(decision_tree, distribution=True, min_value=0, max_value=60*24) -> dict:
+def transform_river_decision_tree_data(decision_tree, distribution=True, min_value=0, max_value=MAX_DURATION_MINUTES) -> dict:
 
     if decision_tree.height == 0:
         if distribution:
@@ -150,7 +164,7 @@ def transform_river_decision_tree_data(decision_tree, distribution=True, min_val
                 sampled_values = [value]
             else:
                 # Sample 100 values from a normal distribution
-                sampled_values = np.random.normal(loc=value, scale=std_dev, size=1000)
+                sampled_values = np.random.normal(loc=value, scale=std_dev, size=DEFAULT_SAMPLE_SIZE)
                 sampled_values[sampled_values < min_value] = value
                 sampled_values[sampled_values > max_value] = value
                 sampled_values = sampled_values.tolist()
@@ -208,7 +222,7 @@ def transform_river_decision_tree_data(decision_tree, distribution=True, min_val
                     sampled_values = [value]
                 else:
                     # Sample 100 values from a normal distribution
-                    sampled_values = np.random.normal(loc=value, scale=std_dev, size=max(1000, int(row['stats'].n)))
+                    sampled_values = np.random.normal(loc=value, scale=std_dev, size=max(DEFAULT_SAMPLE_SIZE, int(row['stats'].n)))
                     sampled_values[sampled_values < min_value] = value
                     sampled_values[sampled_values > max_value] = value
                     sampled_values = sampled_values.tolist()
@@ -238,15 +252,9 @@ class DecisionRules:
         nodes, edges = parse_tree(self.graph.source)
         self.rules = build_tree_structure(nodes, edges)
 
-    def from_river_decision_tree(self, decision_tree, distribution=False, min_value=0, max_value=60*24):
+    def from_river_decision_tree(self, decision_tree, distribution=False, min_value=0, max_value=MAX_DURATION_MINUTES):
         self.decision_tree = decision_tree
         self.rules = transform_river_decision_tree_data(decision_tree, distribution, min_value, max_value)
-
-    def from_dict(self, dict_value):
-        if type(dict_value) == float:
-            self.rules = dict_value
-        else:
-            self.rules = sampling_from_dist(dict_value[0], dict_value[1], dict_value[2], dict_value[3], dict_value[1])
 
     def apply(self, features):
         return traverse_tree(self.rules, features)

@@ -42,16 +42,22 @@ def discover_resources_per_act(log: EventLog, activities: list, resources: list,
     return R_act
 
 
-def return_multitasking_resources(df_features: pd.DataFrame, thr = 0.05) -> list:
-    
-    def condition(group):
+def return_max_concurrency(df_features: pd.DataFrame, thr: float = 0.05) -> dict:
+    """
+    Returns a dict {resource: max_concurrent_tasks}.
+    Resources where more than `thr` fraction of events have concurrent workload > 0
+    are treated as multitasking; their capacity is set to the maximum observed
+    concurrency + 1 (the resource itself). Non-multitasking resources get capacity 1.
+    """
+    max_concurrency = {}
+    for resource, group in df_features[~df_features['resource'].isna()].groupby('resource'):
         total = len(group)
         positive = (group['res_workload'] > 0).sum()
-        return (positive / total) >= thr
-
-    filtered = df_features.groupby('resource').filter(condition)
-
-    return filtered['resource'].unique().tolist()
+        if total > 0 and (positive / total) >= thr:
+            max_concurrency[resource] = int(group['res_workload'].max()) + 1
+        else:
+            max_concurrency[resource] = 1
+    return max_concurrency
 
 
 def discover_weight_resources(
@@ -59,9 +65,11 @@ def discover_weight_resources(
         net_transition_labels: list,
         resources: list,
         max_depths_cv: list = range(1,6),
-        label_data_attributes: list = [], 
-        label_data_attributes_categorical: list = [], 
-        values_categorical: dict = dict()
+        min_samples_leaf_cv: list = [1, 5, 10],
+        label_data_attributes: list = [],
+        label_data_attributes_categorical: list = [],
+        values_categorical: dict = dict(),
+        random_state: int = 72
     ) -> dict :
 
     df_features = df_features[~df_features["resource"].isna()]
@@ -74,9 +82,11 @@ def discover_weight_resources(
                                     net_transition_labels,
                                     resources,
                                     max_depths_cv,
-                                    label_data_attributes, 
-                                    label_data_attributes_categorical, 
-                                    values_categorical
+                                    min_samples_leaf_cv,
+                                    label_data_attributes,
+                                    label_data_attributes_categorical,
+                                    values_categorical,
+                                    random_state=random_state
                                 )
 
     return weights_r
@@ -87,12 +97,14 @@ def build_models(
         net_transition_labels: list,
         resources: list,
         max_depths_cv: list = range(1,6),
-        label_data_attributes: list = [], 
-        label_data_attributes_categorical: list = [], 
-        values_categorical: dict = dict()
+        min_samples_leaf_cv: list = [1, 5, 10],
+        label_data_attributes: list = [],
+        label_data_attributes_categorical: list = [],
+        values_categorical: dict = dict(),
+        random_state: int = 72
     ) -> dict :
-    
-    param_grid = {'max_depth': max_depths_cv}
+
+    param_grid = {'max_depth': max_depths_cv, 'min_samples_leaf': min_samples_leaf_cv, 'max_features': [None, 'sqrt']}
 
     datasets_r = build_training_datasets(
                     df_features,
@@ -118,16 +130,16 @@ def build_models(
         y = data_r['class']
 
         if max_depths_cv:
-            clf_r_dtc = DecisionTreeClassifier(random_state=72)
+            clf_r_dtc = DecisionTreeClassifier(random_state=random_state, class_weight='balanced')
             try:
                 grid_search = GridSearchCV(estimator=clf_r_dtc, param_grid=param_grid, cv=3).fit(X, y)
                 clf_r_dtc = grid_search.best_estimator_
-            except:
-                clf_r_dtc = DecisionTreeClassifier(max_depth=2, random_state=72)
+            except Exception:
+                clf_r_dtc = DecisionTreeClassifier(max_depth=2, random_state=random_state, class_weight='balanced')
                 clf_r_dtc.fit(X, y)
         else:
-            clf_t_dtc = DecisionTreeClassifier(random_state=72, max_depth=1)
-            clf_t_dtc.fit(X, y)
+            clf_r_dtc = DecisionTreeClassifier(random_state=random_state, max_depth=1, class_weight='balanced')
+            clf_r_dtc.fit(X, y)
 
         clf_r = DecisionRules()
         clf_r.from_decision_tree(clf_r_dtc)
@@ -147,7 +159,9 @@ def build_training_datasets(
         label_data_attributes: list
     ) -> dict:
 
-    df_res = df_features[["resource", "prev_enabled_resources"] + resources + label_data_attributes + net_transition_labels]
+    handover_from_cols = ['handover_from_' + r for r in resources]
+    last_activity_cols = ['last_activity_' + t_l for t_l in net_transition_labels]
+    df_res = df_features[["resource", "prev_enabled_resources"] + resources + label_data_attributes + net_transition_labels + handover_from_cols + last_activity_cols]
 
     df_res = df_res.explode('prev_enabled_resources')
     df_res['class'] = (df_res['prev_enabled_resources'] == df_res['resource']).astype(int)
@@ -155,6 +169,6 @@ def build_training_datasets(
     df_res = df_res.drop(columns=['resource'])
     df_res = df_res.rename(columns={'prev_enabled_resources': 'resource'})
         
-    datasets_r = {r: df_res[df_res["resource"] == r].drop(columns=['resource']).reset_index(drop=True) for r in resources}
+    datasets_r = {r: group.drop(columns=['resource']).reset_index(drop=True) for r, group in df_res.groupby('resource')}
 
     return datasets_r

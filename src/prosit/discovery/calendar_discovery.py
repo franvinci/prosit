@@ -8,24 +8,19 @@ def discover_arrival_calendar(log: EventLog, thr_h: float = 0.95, thr_wd: float 
     for trace in log:
         ts = trace[0]['start:timestamp']
         N_events_per_hour[ts.weekday()][ts.hour] += 1
-        ts = trace[0]['time:timestamp']
-        N_events_per_hour[ts.weekday()][ts.hour] += 1
 
     N_events_per_hour_perc = {wd: {h: 0 for h in range(24)} for wd in range(7)}
+    weekday_totals = {wd: sum(N_events_per_hour[wd].values()) for wd in range(7)}
 
     for weekday in range(7):
+        total = weekday_totals[weekday]
         for h in range(24):
-            if sum(N_events_per_hour[weekday].values()):
-                N_events_per_hour_perc[weekday][h] = N_events_per_hour[weekday][h] / sum(N_events_per_hour[weekday].values())
-            else:
-                N_events_per_hour_perc[weekday][h] = 0
+            N_events_per_hour_perc[weekday][h] = N_events_per_hour[weekday][h] / total if total else 0
 
-    N_events_per_wd = {wd: 0 for wd in range(7)}
+    N_events_per_wd = {wd: weekday_totals[wd] for wd in range(7)}
 
-    for weekday in range(7):
-        N_events_per_wd[weekday] += sum(N_events_per_hour[weekday].values())
-
-    N_events_per_wd_perc = {wd: N_events_per_wd[wd]/sum(N_events_per_wd.values()) if sum(N_events_per_wd.values()) else 0 for wd in range(7)}
+    grand_total = sum(N_events_per_wd.values())
+    N_events_per_wd_perc = {wd: N_events_per_wd[wd] / grand_total if grand_total else 0 for wd in range(7)}
 
     calendar = {wd: {h: False for h in range(24)} for wd in range(7)}
     
@@ -76,22 +71,21 @@ def discover_res_calendars(log: EventLog, resources: list = [], thr_h: float = 0
     N_events_per_hour_res_perc = {res: {wd: {h: 0 for h in range(24)} for wd in range(7)} for res in resources}
 
     for res in resources:
+        wd_totals = {wd: sum(N_events_per_hour_res[res][wd].values()) for wd in range(7)}
         for weekday in range(7):
+            total = wd_totals[weekday]
             for h in range(24):
-                if sum(N_events_per_hour_res[res][weekday].values()):
-                    N_events_per_hour_res_perc[res][weekday][h] = N_events_per_hour_res[res][weekday][h] / sum(N_events_per_hour_res[res][weekday].values())
-                else:
-                    N_events_per_hour_res_perc[res][weekday][h] = 0
+                N_events_per_hour_res_perc[res][weekday][h] = N_events_per_hour_res[res][weekday][h] / total if total else 0
 
+    N_events_per_wd_res = {
+        res: {wd: sum(N_events_per_hour_res[res][wd].values()) for wd in range(7)}
+        for res in resources
+    }
 
-    N_events_per_wd_res = {res: {wd: 0 for wd in range(7)} for res in resources}
-
-    for res in resources:
-        for weekday in range(7):
-            N_events_per_wd_res[res][weekday] += sum(N_events_per_hour_res[res][weekday].values())
-
-
-    N_events_per_wd_res_perc = {res: {wd: N_events_per_wd_res[res][wd]/sum(N_events_per_wd_res[res].values()) if sum(N_events_per_wd_res[res].values()) else 0 for wd in range(7)} for res in resources}
+    N_events_per_wd_res_perc = {
+        res: {wd: N_events_per_wd_res[res][wd] / res_total if (res_total := sum(N_events_per_wd_res[res].values())) else 0 for wd in range(7)}
+        for res in resources
+    }
 
     calendar_wd_hour_res = {}
 
