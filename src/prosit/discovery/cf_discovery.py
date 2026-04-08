@@ -121,6 +121,6 @@ def build_training_datasets(
     df_cf = df_cf.drop(columns=['transition'])
     df_cf = df_cf.rename(columns={'prev_enabled_transitions': 'transition'})
         
-    datasets_t = {t: group.drop(columns=['transition']).reset_index(drop=True) for t, group in df_cf.groupby('transition')}
+    datasets_t = {t: group.drop(columns=['transition']).reset_index(drop=True) for t, group in df_cf.groupby('transition', sort=False)}
 
     return datasets_t

@@ -1,6 +1,6 @@
 import random
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from copy import copy
 
 import pm4py
@@ -304,7 +304,7 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
                     concurrent = (re['start_ts'] < enabled_ts) & (re['end_ts'] > enabled_ts)
                     res_workload = int(concurrent.sum())
                     if res_workload > 0:
-                        resource_free_t = datetime.fromtimestamp(re['end_ts'][concurrent].max())
+                        resource_free_t = datetime.fromtimestamp(re['end_ts'][concurrent].max(), tz=timezone.utc)
                     else:
                         resource_free_t = enabled_t
                 else:
