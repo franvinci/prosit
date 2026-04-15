@@ -104,7 +104,7 @@ def discover_waiting_time(
 
 # BUILD ML MODELS
 
-def _fit_decision_rules(X, y, param_grid, max_depths, random_state) -> DecisionRules:
+def _fit_decision_rules(X, y, param_grid, max_depths, random_state, use_outlier_removal=True) -> DecisionRules:
     if len(X) == 0:
         clf = DecisionRules()
         clf.rules = {0: {'value': 0.0, 'sampled': [0], 'dist': ('fixed', (0,))}}
@@ -128,7 +128,7 @@ def _fit_decision_rules(X, y, param_grid, max_depths, random_state) -> DecisionR
     clf.from_decision_tree(clf_mean)
 
     for l in y_leaf['Leaf'].unique():
-        y_l = remove_outliers(y_leaf[y_leaf['Leaf'] == l]['Y'])
+        y_l = remove_outliers(y_leaf[y_leaf['Leaf'] == l]['Y']) if use_outlier_removal else y_leaf[y_leaf['Leaf'] == l]['Y'].values
         min_value = np.min(y_l)
         max_value = np.max(y_l)
         dist, params = return_best_distribution(y_l, dist_search=DIST_SEARCH)
@@ -151,7 +151,7 @@ def build_model_arrival(
     df = build_training_df_arrival(log, calendar_arrival)
     X = df.drop(columns=['arrival_time'])
     y = df['arrival_time']
-    return _fit_decision_rules(X, y, param_grid, max_depths, random_state)
+    return _fit_decision_rules(X, y, param_grid, max_depths, random_state, use_outlier_removal=False)
 
 
 
@@ -220,7 +220,7 @@ def build_models_wt(
         df_res = df[df['resource'] == res].iloc[:, 1:]
         X = df_res.drop(columns=['waiting_time'])
         y = df_res['waiting_time']
-        models_res[res] = _fit_decision_rules(X, y, param_grid, max_depths, random_state)
+        models_res[res] = _fit_decision_rules(X, y, param_grid, max_depths, random_state, use_outlier_removal=False)
 
     return models_res
 
@@ -229,7 +229,7 @@ def build_models_wt(
 # BUILD TRAINING DATASETS
 
 def build_training_df_arrival(
-        log: EventLog, 
+        log: EventLog,
         calendar_arrival: dict
     ) -> pd.DataFrame:
 
@@ -293,7 +293,7 @@ def build_training_df_wt(
         values_categorical: dict
     ) -> dict:
 
-    df_wt = df_features[["resource", "transition_label", "start_t", "resource_free_t", "res_workload"] + label_data_attributes + net_transition_labels]
+    df_wt = df_features[["resource", "transition_label", "start_t", "resource_free_t", "res_workload", "queue_length"] + label_data_attributes + net_transition_labels]
     df_wt = df_wt[~df_wt["start_t"].isna()]
     working_sets_wt = {r: calendar_to_working_set(calendars[r]) for r in calendars}
     df_wt["waiting_time"] = df_wt.apply(lambda x: count_working_minutes(x["resource_free_t"], x["start_t"], calendars[x["resource"]], working_sets_wt[x["resource"]]), axis=1)
@@ -316,7 +316,7 @@ def build_training_df_wt(
 
 # NO RULES MODE
 
-def find_best_distribution_arrival(log: EventLog, 
+def find_best_distribution_arrival(log: EventLog,
         calendar_arrival: dict
     ) -> tuple:
 
@@ -325,10 +325,9 @@ def find_best_distribution_arrival(log: EventLog,
     ordered_first_ts_list = first_ts.sort_values().tolist()
 
     arrival_times = []
-    arrival_working_set2 = calendar_to_working_set(calendar_arrival)
+    arrival_working_set = calendar_to_working_set(calendar_arrival)
     for i in range(1, len(ordered_first_ts_list)):
-        arrival_times.append(count_working_minutes(ordered_first_ts_list[i-1], ordered_first_ts_list[i], calendar_arrival, arrival_working_set2))
-    arrival_times = remove_outliers(arrival_times)
+        arrival_times.append(count_working_minutes(ordered_first_ts_list[i-1], ordered_first_ts_list[i], calendar_arrival, arrival_working_set))
 
     dist, params = return_best_distribution(arrival_times, dist_search=DIST_SEARCH)
     min_value = np.min(arrival_times)

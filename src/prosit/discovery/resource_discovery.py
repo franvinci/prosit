@@ -7,22 +7,17 @@ from tqdm import tqdm
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import GridSearchCV
 
-from prosit.utils.rule_utils import DecisionRules
+from prosit.utils.rule_utils import DecisionRules, apply_laplace_smoothing, BINARY_NEG_LOG_LOSS_SCORER
 
 
-def discover_resources_list(log: EventLog, thr: float = 1.0) -> list:
+def discover_resources_list(log: EventLog) -> list:
 
     resource_counts = pd.Series(pm4py.get_event_attribute_values(log, 'org:resource'))
-    resource_counts = resource_counts / resource_counts.sum()
     resource_counts = resource_counts.sort_values(ascending=False)
-    resource_counts_cumsum = resource_counts.cumsum()
-    resource_counts = resource_counts[resource_counts_cumsum <= thr]
-    resources = resource_counts.index.tolist()
-
-    return resources
+    return resource_counts.index.tolist()
 
 
-def discover_resources_per_act(log: EventLog, activities: list, resources: list, thr: float = 1.0) -> dict:
+def discover_resources_per_act(log: EventLog, activities: list, resources: list) -> dict:
 
     df_log = pm4py.convert_to_dataframe(log)
     df_log = df_log[df_log["concept:name"].isin(activities)]
@@ -32,12 +27,7 @@ def discover_resources_per_act(log: EventLog, activities: list, resources: list,
     for act in activities:
         df_log_act = df_log[df_log["concept:name"] == act]
         res_counts_act = df_log_act["org:resource"].value_counts()
-        res_counts_act = res_counts_act / res_counts_act.sum()
-        res_counts_act = res_counts_act.sort_values(ascending=False)
-        res_counts_act_cumsum = res_counts_act.cumsum()
-        res_counts_act = res_counts_act[res_counts_act_cumsum <= thr]
-        resources_act = res_counts_act.index.tolist()
-        R_act[act] = resources_act
+        R_act[act] = res_counts_act.index.tolist()
 
     return R_act
 
@@ -62,42 +52,72 @@ def return_max_concurrency(df_features: pd.DataFrame, thr: float = 0.05) -> dict
 
 def discover_weight_resources(
         df_features: pd.DataFrame,
-        net_transition_labels: list,
+        act_to_resources: dict,
         resources: list,
+        max_concurrency: dict,
         max_depths_cv: list = range(1,6),
-        min_samples_leaf_cv: list = [1, 5, 10],
+        min_samples_leaf_cv: list = [5, 10, 20],
         label_data_attributes: list = [],
         label_data_attributes_categorical: list = [],
         values_categorical: dict = dict(),
         random_state: int = 72
     ) -> dict :
+    """Return ``{resource: classifier}``.
+
+    One binary classifier per resource, trained on events where the resource
+    was a candidate (i.e. in the activity's role pool) AND was actually free
+    at the enabling time (workload below its max concurrency). Features are
+    per-resource history counts, case attributes, and the resource's own
+    workload at enabling time. This matches the simulator's inference path:
+    the classifier is invoked only on free candidates, so training must
+    mirror that conditional distribution.
+    """
 
     df_features = df_features[~df_features["resource"].isna()]
 
     if not max_depths_cv:
-        weights_r = {r: (df_features["resource"] == r).sum() / df_features["prev_enabled_resources"].apply(lambda r_set: r in r_set).sum() for r in resources}
-    else:
-        weights_r = build_models(
-                                    df_features,
-                                    net_transition_labels,
-                                    resources,
-                                    max_depths_cv,
-                                    min_samples_leaf_cv,
-                                    label_data_attributes,
-                                    label_data_attributes_categorical,
-                                    values_categorical,
-                                    random_state=random_state
-                                )
+        weights = {}
+        r_to_acts = _resource_to_eligible_acts(act_to_resources, resources)
+        for r in resources:
+            eligible = r_to_acts.get(r, set())
+            if not eligible:
+                weights[r] = 0.0
+                continue
+            scope = df_features[df_features['transition_label'].isin(eligible)]
+            if scope.empty:
+                weights[r] = 0.0
+                continue
+            free_mask = scope['candidate_workloads'].apply(
+                lambda d: isinstance(d, dict) and d.get(r, 0) < max_concurrency.get(r, 1)
+            )
+            scope = scope[free_mask]
+            if scope.empty:
+                weights[r] = 0.0
+                continue
+            weights[r] = float((scope['resource'] == r).sum()) / len(scope)
+        return weights
 
-    return weights_r
+    return build_models(
+        df_features,
+        act_to_resources,
+        resources,
+        max_concurrency,
+        max_depths_cv,
+        min_samples_leaf_cv,
+        label_data_attributes,
+        label_data_attributes_categorical,
+        values_categorical,
+        random_state=random_state
+    )
 
 
 def build_models(
         df_features: pd.DataFrame,
-        net_transition_labels: list,
+        act_to_resources: dict,
         resources: list,
+        max_concurrency: dict,
         max_depths_cv: list = range(1,6),
-        min_samples_leaf_cv: list = [1, 5, 10],
+        min_samples_leaf_cv: list = [5, 10, 20],
         label_data_attributes: list = [],
         label_data_attributes_categorical: list = [],
         values_categorical: dict = dict(),
@@ -106,69 +126,118 @@ def build_models(
 
     param_grid = {'max_depth': max_depths_cv, 'min_samples_leaf': min_samples_leaf_cv, 'max_features': [None, 'sqrt']}
 
-    datasets_r = build_training_datasets(
-                    df_features,
-                    net_transition_labels,
-                    resources,
-                    label_data_attributes
-                )
+    datasets = build_training_datasets(
+        df_features,
+        act_to_resources,
+        resources,
+        max_concurrency,
+        label_data_attributes,
+    )
 
-    models_r = dict()
-    
-    for r in tqdm(datasets_r.keys()):
-        data_r = datasets_r[r]
-        if len(data_r['class'].unique())<2:
-            models_r[r] = None
+    models = dict()
+
+    for r, data_r in tqdm(datasets.items()):
+        if len(data_r['class'].unique()) < 2:
+            # Constant label — store scalar probability (0 or 1).
+            models[r] = float(data_r['class'].iloc[0]) if len(data_r) else 0.0
             continue
-        
+
         for a in label_data_attributes_categorical:
             for v in values_categorical[a]:
-                data_r[a+' = '+str(v)] = (data_r[a] == v).astype(int)
+                data_r[a + ' = ' + str(v)] = (data_r[a] == v).astype(int)
             del data_r[a]
 
         X = data_r.drop(columns=['class'])
         y = data_r['class']
 
         if max_depths_cv:
-            clf_r_dtc = DecisionTreeClassifier(random_state=random_state, class_weight='balanced')
+            clf_dtc = DecisionTreeClassifier(random_state=random_state)
             try:
-                grid_search = GridSearchCV(estimator=clf_r_dtc, param_grid=param_grid, cv=3).fit(X, y)
-                clf_r_dtc = grid_search.best_estimator_
+                grid_search = GridSearchCV(
+                    estimator=clf_dtc,
+                    param_grid=param_grid,
+                    cv=3,
+                    scoring=BINARY_NEG_LOG_LOSS_SCORER,
+                ).fit(X, y)
+                clf_dtc = grid_search.best_estimator_
             except Exception:
-                clf_r_dtc = DecisionTreeClassifier(max_depth=2, random_state=random_state, class_weight='balanced')
-                clf_r_dtc.fit(X, y)
+                clf_dtc = DecisionTreeClassifier(max_depth=2, random_state=random_state)
+                clf_dtc.fit(X, y)
         else:
-            clf_r_dtc = DecisionTreeClassifier(random_state=random_state, max_depth=1, class_weight='balanced')
-            clf_r_dtc.fit(X, y)
+            clf_dtc = DecisionTreeClassifier(random_state=random_state, max_depth=1)
+            clf_dtc.fit(X, y)
 
-        clf_r = DecisionRules()
-        clf_r.from_decision_tree(clf_r_dtc)
+        apply_laplace_smoothing(clf_dtc, alpha=1.0)
 
-        if clf_r is None:
-            clf_r = float(y.mode().iloc[0])
+        clf = DecisionRules()
+        clf.from_decision_tree(clf_dtc)
 
-        models_r[r] = clf_r
-    
-    return models_r
+        if clf is None:
+            clf = float(y.mode().iloc[0])
+
+        models[r] = clf
+
+    return models
+
+
+def _resource_to_eligible_acts(act_to_resources: dict, resources: list) -> dict:
+    """Invert ``act_to_resources`` to ``{resource: set(activities)}``."""
+    r_to_acts = {r: set() for r in resources}
+    for a, rs in act_to_resources.items():
+        for r in rs:
+            if r in r_to_acts:
+                r_to_acts[r].add(a)
+    return r_to_acts
 
 
 def build_training_datasets(
         df_features: pd.DataFrame,
-        net_transition_labels: list,
+        act_to_resources: dict,
         resources: list,
-        label_data_attributes: list
+        max_concurrency: dict,
+        label_data_attributes: list,
     ) -> dict:
+    """Return ``{resource: training_df}``.
 
-    handover_from_cols = ['handover_from_' + r for r in resources]
-    last_activity_cols = ['last_activity_' + t_l for t_l in net_transition_labels]
-    df_res = df_features[["resource", "prev_enabled_resources"] + resources + label_data_attributes + net_transition_labels + handover_from_cols + last_activity_cols]
+    One training set per resource. Scope: events whose activity has the
+    resource in its candidate pool AND where the resource was actually free
+    (``workload < max_concurrency[r]``) at the enabling time. Features:
+    per-resource history counts, case attributes, and the resource's own
+    workload at enabling time. Target ``class`` is ``1`` when this resource
+    actually performed the event, ``0`` otherwise.
+    """
 
-    df_res = df_res.explode('prev_enabled_resources')
-    df_res['class'] = (df_res['prev_enabled_resources'] == df_res['resource']).astype(int)
+    res_history_cols = list(resources)
+    feature_cols = res_history_cols + list(label_data_attributes)
 
-    df_res = df_res.drop(columns=['resource'])
-    df_res = df_res.rename(columns={'prev_enabled_resources': 'resource'})
-        
-    datasets_r = {r: group.drop(columns=['resource']).reset_index(drop=True) for r, group in df_res.groupby('resource')}
+    r_to_acts = _resource_to_eligible_acts(act_to_resources, resources)
 
-    return datasets_r
+    datasets = {}
+    for r in resources:
+        eligible_acts = r_to_acts.get(r, set())
+        if not eligible_acts:
+            continue
+        df_scope = df_features[df_features['transition_label'].isin(eligible_acts)]
+        if df_scope.empty:
+            continue
+        max_c = max_concurrency.get(r, 1)
+        workload_r = df_scope['candidate_workloads'].apply(
+            lambda d: d.get(r, 0) if isinstance(d, dict) else 0
+        )
+        free_mask = workload_r < max_c
+        df_scope = df_scope[free_mask]
+        workload_r = workload_r[free_mask]
+        if df_scope.empty:
+            continue
+        queue_r = df_scope['candidate_queue_lengths'].apply(
+            lambda d: d.get(r, 0) if isinstance(d, dict) else 0
+        )
+        base = df_scope[feature_cols].reset_index(drop=True)
+        actual = df_scope['resource'].reset_index(drop=True)
+        df_r = base.copy()
+        df_r['workload'] = workload_r.reset_index(drop=True).values
+        df_r['queue_length'] = queue_r.reset_index(drop=True).values
+        df_r['class'] = (actual == r).astype(int).values
+        datasets[r] = df_r
+
+    return datasets

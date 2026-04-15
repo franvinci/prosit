@@ -23,6 +23,20 @@ def name_to_transition(s: str, net: PetriNet) -> PetriNet.Transition:
             return t
 
 
+def _to_py(obj):
+    """Recursively cast numpy scalars / arrays to JSON-serializable Python types."""
+    import numpy as np
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return [_to_py(x) for x in obj.tolist()]
+    if isinstance(obj, (list, tuple)):
+        return [_to_py(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _to_py(v) for k, v in obj.items()}
+    return obj
+
+
 def decision_rules_to_dict(d: DecisionRules) -> dict:
 
     def convert(obj):
@@ -34,20 +48,20 @@ def decision_rules_to_dict(d: DecisionRules) -> dict:
                 new_obj[k] = convert(v)
             return new_obj
         elif isinstance(obj, tuple):
-            return {"dist_name": convert(obj[0]), "params": obj[1], "min_value": obj[2], "max_value": obj[3]}
-         
+            return {"dist_name": convert(obj[0]), "params": _to_py(obj[1]), "min_value": _to_py(obj[2]), "max_value": _to_py(obj[3])}
+
         elif hasattr(obj, '__module__') and obj.__module__.startswith("scipy.stats"):
             return obj.name  # Convert scipy distribution to string
         else:
-            return obj
+            return _to_py(obj)
 
     if isinstance(d, tuple):
-        return {"dist_name": convert(d[0]), "params": d[1], "min_value": d[2], "max_value": d[3], "mean_value": d[4]}
+        return {"dist_name": convert(d[0]), "params": _to_py(d[1]), "min_value": _to_py(d[2]), "max_value": _to_py(d[3]), "mean_value": _to_py(d[4])}
 
     if not isinstance(d, DecisionRules):
         if d is None:
             d = 1
-        return d
+        return _to_py(d)
 
     return convert(copy.deepcopy(d.rules))
 

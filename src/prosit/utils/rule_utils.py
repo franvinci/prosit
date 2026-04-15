@@ -1,13 +1,50 @@
 import re
 from sklearn.tree import export_graphviz
+from sklearn.metrics import log_loss, make_scorer
 import graphviz
 import random
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
 
+
+# Scorer for GridSearchCV on binary classifiers. Uses ``labels=[0, 1]`` so that
+# log_loss stays defined even when a CV fold contains only one class (which
+# happens on small or heavily imbalanced training sets for per-resource /
+# per-transition models). Log loss rewards calibration, which is what matters
+# here: the simulator samples resources/transitions proportionally to leaf
+# probabilities, so miscalibration biases the sampling distribution.
+BINARY_NEG_LOG_LOSS_SCORER = make_scorer(
+    log_loss,
+    response_method='predict_proba',
+    greater_is_better=False,
+    labels=[0, 1],
+)
+
 MAX_DURATION_MINUTES = 60 * 24  # 1440 minutes = 24 hours
 DEFAULT_SAMPLE_SIZE = 1000
+
+
+def apply_laplace_smoothing(clf, alpha: float = 1.0):
+    """Add-alpha smoothing to leaf class distributions of a fitted sklearn classifier.
+
+    Recent sklearn versions (>=1.3) store ``tree_.value`` already normalized as
+    class proportions. This function recovers raw (weighted) counts via
+    ``weighted_n_node_samples``, applies ``(n_c + alpha) / (n_total + K*alpha)``
+    at each leaf, and writes the smoothed proportions back. This avoids 0/1
+    leaves that zero out competitors when the simulator uses these
+    probabilities as sampling weights.
+    """
+    tree_ = clf.tree_
+    n_classes = tree_.value.shape[2]
+    for node_id in range(tree_.node_count):
+        if tree_.children_left[node_id] == tree_.children_right[node_id]:
+            n_total = float(tree_.weighted_n_node_samples[node_id])
+            proportions = tree_.value[node_id, 0, :]
+            counts = proportions * n_total
+            smoothed = (counts + alpha) / (n_total + alpha * n_classes)
+            tree_.value[node_id, 0, :] = smoothed
+    return clf
 
 
 def build_graph_vis(model_t, model_distributions=False):

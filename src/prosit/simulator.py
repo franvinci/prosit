@@ -26,7 +26,7 @@ from prosit.utils.common_utils import (
     add_minutes_with_calendar,
     build_df_features,
     return_resource,
-    compute_resource_weights_from_model
+    compute_resource_weights_from_model,
     )
 from prosit.utils.distribution_utils import sampling_from_dist
 from prosit.utils.save_and_load_utils import decision_rules_to_dict, transition_to_name, convert_calendar_names, dict_to_decrules, name_to_transition, fromstr_to_scipy
@@ -60,8 +60,8 @@ class SimulatorParameters:
 
         self.transition_weights: dict = {t: 1 for t in list(self.net.transitions)}
         self.resources: list = ['auto']
-        self.resource_weights: dict = {"auto": 1}
         self.act_to_resources: dict = {act: [r for r in self.resources] for act in self.net_transition_labels}
+        self.resource_weights: dict = {"auto": 1}
         self.max_concurrency: dict = {'auto': 1}
         self.calendars: dict = {'auto': {wd: {h: True for h in range(24)} for wd in range(7)}}
         self.arrival_calendar: dict = {wd: {h: True for h in range(24)} for wd in range(7)}
@@ -76,14 +76,11 @@ class SimulatorParameters:
     def discover_from_eventlog(
             self,
             log: EventLog,
-            max_depth_tree: int = 3,
+            max_depth_tree: int = 5,
             min_samples_leaf_cv: list = [5, 10, 20, 30],
-            resource_thr: float = 0.95,
-            calendar_thr_h: float = 0.95,
-            calendar_thr_wd: float = 0.95,
             multitasking_thr: float = 0.05,
-            enable_multitasking: bool = True,
-            attribute_mode: str = 'empirical',
+            enable_multitasking: bool = False,
+            attribute_mode: str = 'distribution',
             incremental_discovery: bool = False,
             grace_period: int = 1000,
             random_state: int = 72,
@@ -105,8 +102,8 @@ class SimulatorParameters:
 
         if verbose:
             print("Resources discovery...")
-        self.resources = discover_resources_list(log, thr=resource_thr)
-        self.act_to_resources = discover_resources_per_act(log, self.net_transition_labels, self.resources, thr=resource_thr)
+        self.resources = discover_resources_list(log)
+        self.act_to_resources = discover_resources_per_act(log, self.net_transition_labels, self.resources)
 
         if self.label_data_attributes:
             if verbose:
@@ -168,19 +165,21 @@ class SimulatorParameters:
         if incremental_discovery:
             self.resource_weights = incremental_resource_weights_learning(
                                                                             df_features,
-                                                                            self.net_transition_labels,
+                                                                            self.act_to_resources,
                                                                             self.resources,
+                                                                            self.max_concurrency,
                                                                             max_depth_tree,
                                                                             grace_period,
-                                                                            self.label_data_attributes, 
-                                                                            self.label_data_attributes_categorical, 
+                                                                            self.label_data_attributes,
+                                                                            self.label_data_attributes_categorical,
                                                                             self.attribute_values_label_categorical
                                                                         )
         else:
             self.resource_weights = discover_weight_resources(
                                                                 df_features,
-                                                                self.net_transition_labels,
+                                                                self.act_to_resources,
                                                                 self.resources,
+                                                                self.max_concurrency,
                                                                 max_depth_cv,
                                                                 min_samples_leaf_cv,
                                                                 self.label_data_attributes,
@@ -191,8 +190,8 @@ class SimulatorParameters:
 
         if verbose:
             print("Calendars discovery...")
-        self.calendars = discover_res_calendars(log, self.resources, thr_h=calendar_thr_h, thr_wd=calendar_thr_wd)
-        self.arrival_calendar = discover_arrival_calendar(log, thr_h=calendar_thr_h, thr_wd=calendar_thr_wd)
+        self.calendars = discover_res_calendars(log, self.resources)
+        self.arrival_calendar = discover_arrival_calendar(log)
 
         if verbose:
             if incremental_discovery:
@@ -294,7 +293,9 @@ class SimulatorParameters:
                 "resources" : self.resources,
                 "max_concurrency": self.max_concurrency,
                 "act_to_resources": self.act_to_resources,
-                "resource_weights": {r: decision_rules_to_dict(dr) for r, dr in self.resource_weights.items()},
+                "resource_weights": {
+                    r: decision_rules_to_dict(dr) for r, dr in self.resource_weights.items()
+                },
                 "calendars": {r: convert_calendar_names(cal) for r, cal in self.calendars.items()}
                 },
 
@@ -360,7 +361,13 @@ class SimulatorParameters:
 
         self.resources = dict_params["resource_params"]["resources"]
         self.act_to_resources = dict_params["resource_params"]["act_to_resources"]
-        self.resource_weights = {res: dict_to_decrules(value) for res, value in dict_params["resource_params"]["resource_weights"].items()}
+        raw_rw = dict_params["resource_params"]["resource_weights"]
+        self.resource_weights = {}
+        for res, value in raw_rw.items():
+            if isinstance(value, (int, float)):
+                self.resource_weights[res] = float(value)
+            else:
+                self.resource_weights[res] = dict_to_decrules(value)
         resource_params = dict_params["resource_params"]
         if "max_concurrency" in resource_params:
             self.max_concurrency = {r: int(v) for r, v in resource_params["max_concurrency"].items()}
@@ -413,6 +420,7 @@ class SimulatorEngine:
         enabled_heap = []
         resource_schedule = {r: [] for r in self.simulation_parameters.resources}
         cases = []
+        firing_sequences = {f"case_{i+1}": [] for i in range(n_traces)}
 
         if not self.simulation_parameters.rules_mode:
             if deterministic_time:
@@ -489,7 +497,7 @@ class SimulatorEngine:
                         arrival_delta = self.simulation_parameters.arrival_time_distribution.apply_distribution(arrival_features)
                 if arrival_delta == 0:
                     arrival_delta = 1
-                current_arr_ts = add_minutes_with_calendar(current_arr_ts, int(arrival_delta), self.simulation_parameters.arrival_calendar)
+                current_arr_ts = add_minutes_with_calendar(current_arr_ts, round(arrival_delta), self.simulation_parameters.arrival_calendar)
 
             case = {
                 "case_id": i,
@@ -520,7 +528,6 @@ class SimulatorEngine:
             cases.append(case)
 
         _zero_last_activity = {'last_activity_' + t_l: 0 for t_l in self.simulation_parameters.net_transition_labels}
-        _zero_handover = {'handover_from_' + r: 0 for r in self.simulation_parameters.resources}
         _zero_waiting_act = {'waiting_activity = ' + act_label: 0 for act_label in self.simulation_parameters.net_transition_labels}
         _zero_resource_onehot = {'resource = ' + res: 0 for res in self.simulation_parameters.resources}
 
@@ -545,10 +552,12 @@ class SimulatorEngine:
             chosen_transition = return_fired_transition(transition_weights, enabled_transitions)
             activity = chosen_transition.label
             t_enabled = case["enabled"][chosen_transition]
+            firing_sequences[f"case_{case_id+1}"].append(chosen_transition.name)
 
             if activity is not None:
                 enabled_resources_act = self.simulation_parameters.act_to_resources[activity]
                 workloads = {r: count_concurrent_events(resource_schedule[r], t_enabled) for r in enabled_resources_act}
+                queue_lengths_cand = {r: sum(1 for s, _ in resource_schedule[r] if s > t_enabled) for r in enabled_resources_act}
                 enabled_resources = []
                 for r in enabled_resources_act:
                     if workloads[r] < self.simulation_parameters.max_concurrency.get(r, 1):
@@ -559,20 +568,21 @@ class SimulatorEngine:
                     resource = enabled_resources_act[index_res]
                 else:
                     if not self.simulation_parameters.rules_mode:
-                        resource_weights = self.simulation_parameters.resource_weights
+                        resource_weights = {r: self.simulation_parameters.resource_weights.get(r, 0.0) for r in enabled_resources}
                     else:
-                        handover_features = _zero_handover.copy()
-                        if case["last_resource"]:
-                            handover_features['handover_from_' + case["last_resource"]] = 1
-                        last_activity_features = _zero_last_activity.copy()
-                        if case["last_activity"]:
-                            last_activity_features['last_activity_' + case["last_activity"]] = 1
-                        resource_weights = compute_resource_weights_from_model(self.simulation_parameters.resource_weights, enabled_resources, case["res_history"] | case["attributes"] | case["history"] | handover_features | last_activity_features)
+                        resource_weights = compute_resource_weights_from_model(
+                            self.simulation_parameters.resource_weights,
+                            enabled_resources,
+                            case["res_history"] | case["attributes"],
+                            workloads=workloads,
+                            queue_lengths=queue_lengths_cand,
+                        )
                     resource = return_resource(resource_weights, enabled_resources)
                     t_enabled_waited = t_enabled
                 r_workload = workloads[resource]
+                r_queue_length = sum(1 for s, e in resource_schedule[resource] if s > t_enabled)
                 case["res_history"][resource] += 1
-                
+
                 if sum(case["history"].values()) == 0:
                     waiting_time = 0
                 else:
@@ -587,13 +597,13 @@ class SimulatorEngine:
                         waiting_activity_features = _zero_waiting_act.copy()
                         waiting_activity_features['waiting_activity = ' + activity] = 1
                         if deterministic_time:
-                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply({'workload': r_workload} | case["history"] | case["attributes"] | waiting_activity_features)
+                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply({'workload': r_workload, 'queue_length': r_queue_length} | case["history"] | case["attributes"] | waiting_activity_features)
                             if not isinstance(waiting_time, (int, float)):
                                 waiting_time = 0
                         else:
-                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply_distribution({'workload': r_workload} | case["history"] | case["attributes"] | waiting_activity_features)
+                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply_distribution({'workload': r_workload, 'queue_length': r_queue_length} | case["history"] | case["attributes"] | waiting_activity_features)
 
-                t_start_exec = add_minutes_with_calendar(t_enabled_waited, int(max(0, waiting_time)), self.simulation_parameters.calendars[resource])
+                t_start_exec = add_minutes_with_calendar(t_enabled_waited, round(max(0, waiting_time)), self.simulation_parameters.calendars[resource])
 
                 if not self.simulation_parameters.rules_mode:
                     if deterministic_time:
@@ -613,7 +623,7 @@ class SimulatorEngine:
                         ex_time = self.simulation_parameters.execution_time_distributions[activity].apply_distribution(resource_onehot | case["history"] | case["attributes"])
 
                 
-                t_end = add_minutes_with_calendar(t_start_exec, int(ex_time), self.simulation_parameters.calendars[resource])
+                t_end = add_minutes_with_calendar(t_start_exec, round(ex_time), self.simulation_parameters.calendars[resource])
 
                 event_log.append((case_id, activity, resource, t_enabled, t_start_exec, t_end) + tuple(x_attr_list[case_id]))
                 resource_schedule[resource].append((t_start_exec, t_end))
@@ -652,5 +662,6 @@ class SimulatorEngine:
         df_log["case:concept:name"] = df_log["case:concept:name"].apply(lambda x: f"case_{x+1}")
         df_log.sort_values(by=["start:timestamp", "time:timestamp"], inplace=True)
         df_log.reset_index(drop=True, inplace=True)
+        df_log.attrs["prosit_firing_sequences"] = firing_sequences
 
         return df_log

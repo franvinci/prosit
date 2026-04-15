@@ -107,7 +107,7 @@ Prosit extracts the following simulation parameters from an event log:
 | **Execution time** | Working-hours duration of each activity, conditional on resource and case history |
 | **Waiting time** | Queue delay after a resource becomes free, conditional on workload and case context |
 | **Control flow** | Routing probability at each decision point, conditional on case history and attributes |
-| **Resource selection** | Which eligible resource executes each activity, conditional on workload, handover patterns, and case context |
+| **Resource selection** | Which eligible resource executes each activity — one dedicated classifier per (activity, candidate resource) conditional on resource-usage history and case attributes |
 | **Calendars** | Working hours per resource and for case arrivals |
 | **Multitasking** | Maximum concurrent tasks per resource, derived from observed concurrent workload |
 | **Data attributes** | Joint or per-attribute distribution of case-level data attributes (e.g. case type, priority) |
@@ -139,11 +139,8 @@ Holds all simulation parameters. Initialise with the Petri net (typically discov
 ```python
 params.discover_from_eventlog(
     log,
-    max_depth_tree: int = 3,
+    max_depth_tree: int = 5,
     min_samples_leaf_cv: list = [5, 10, 20, 30],
-    resource_thr: float = 0.95,
-    calendar_thr_h: float = 0.95,
-    calendar_thr_wd: float = 0.95,
     multitasking_thr: float = 0.05,
     enable_multitasking: bool = True,
     attribute_mode: str = 'empirical',
@@ -159,11 +156,8 @@ Extracts all simulation parameters from the event log.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `log` | `EventLog` | — | pm4py event log in XES format |
-| `max_depth_tree` | `int` | `3` | Maximum depth of decision trees. Higher = more expressive rules. Set to `0` to disable rules (pure distributions) |
+| `max_depth_tree` | `int` | `5` | Maximum depth of decision trees. Higher = more expressive rules. Set to `0` to disable rules (pure distributions) |
 | `min_samples_leaf_cv` | `list` | `[5,10,20,30]` | Candidate values for `min_samples_leaf` in cross-validation. Controls the minimum number of samples per leaf — critical for reliable per-leaf distribution fitting |
-| `resource_thr` | `float` | `0.95` | Cumulative frequency threshold for resource filtering. Resources whose cumulative share exceeds this value are dropped as outliers |
-| `calendar_thr_h` | `float` | `0.95` | Cumulative threshold for working-hour discovery. Hours beyond this share of activity are excluded from calendars |
-| `calendar_thr_wd` | `float` | `0.95` | Cumulative threshold for working-weekday discovery |
 | `multitasking_thr` | `float` | `0.05` | Minimum fraction of events with concurrent workload > 0 for a resource to be considered multitasking. Below this, capacity is set to 1 |
 | `enable_multitasking` | `bool` | `True` | If `False`, all resources are forced to capacity 1 (no parallel task execution) regardless of what the log shows |
 | `attribute_mode` | `str` | `'empirical'` | How to model case-level data attributes. `'empirical'`: samples from the joint observed distribution (preserves correlations). `'distribution'`: fits each attribute independently (categorical → frequency table, continuous → best-fitting scipy distribution) |
@@ -432,7 +426,11 @@ print(params.execution_time_distributions)
 # Waiting time model per resource (DecisionRules or distribution tuple)
 print(params.waiting_time_distributions)
 
-# Resource selection model per resource (DecisionRules in rules mode, float frequency in no-rules)
+# Resource selection: flat dict {resource: DecisionRules|float}. One binary
+# classifier per resource, trained on the events where the resource was
+# eligible (activity's candidate pool). At simulation time, the engine first
+# filters resources via `act_to_resources[activity]`, scores each enabled
+# resource with its own tree, and samples proportionally.
 print(params.resource_weights)
 
 # Control flow model per transition (DecisionRules in rules mode, float frequency in no-rules)
@@ -456,7 +454,7 @@ print(params.distribution_data_attributes)
 | Execution time | Regressor | Resource identity (one-hot), activity execution history, case attributes |
 | Waiting time | Regressor | Resource workload, activity being executed (one-hot), activity history, case attributes |
 | Control flow | Classifier | Activity execution history, last activity executed (one-hot), case attributes |
-| Resource selection | Classifier | Resource usage history, last resource used (one-hot handover), last activity (one-hot), case attributes |
+| Resource selection | Classifier (per activity) | Resource usage history (counts), case attributes |
 
 History features are expressed as **raw counts** (number of times each activity has been executed in the case so far), so that decision tree rules are directly interpretable (e.g. `"Approve" <= 2` means "Approve has been executed at most 2 times").
 

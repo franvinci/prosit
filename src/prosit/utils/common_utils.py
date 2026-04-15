@@ -26,7 +26,10 @@ def return_transitions_frequency(
         final_marking: Marking
     ) -> dict:
 
-    alignments_ = alignments.apply_log(log, net, initial_marking, final_marking, parameters={"ret_tuple_as_trans_desc": True})
+    try:
+        alignments_ = alignments.apply_multiprocessing(log, net, initial_marking, final_marking, parameters={"ret_tuple_as_trans_desc": True})
+    except Exception:
+        alignments_ = alignments.apply_log(log, net, initial_marking, final_marking, parameters={"ret_tuple_as_trans_desc": True})
     aligned_traces = [[y[0] for y in x['alignment'] if y[0][1]!='>>'] for x in alignments_]
 
     frequency_t = {t: 0 for t in net.transitions}
@@ -140,13 +143,22 @@ def return_resource(resource_weights: dict, enabled_resources: list) -> str:
     return enabled_resources[-1]
 
 
-def compute_resource_weights_from_model(models_r: dict, enabled_resources: list, dict_x: dict) -> dict:
+def compute_resource_weights_from_model(models_r: dict, enabled_resources: list, dict_x: dict, workloads: dict = None, queue_lengths: dict = None) -> dict:
     resource_weights = dict()
     for r in enabled_resources:
-        if type(models_r[r]) == DecisionRules:
-            resource_weights[r] = models_r[r].apply(dict_x)
-        elif type(models_r[r]) == float:
-            resource_weights[r] = models_r[r]
+        model = models_r.get(r)
+        if workloads is not None or queue_lengths is not None:
+            x_r = dict(dict_x)
+            if workloads is not None:
+                x_r['workload'] = workloads.get(r, 0)
+            if queue_lengths is not None:
+                x_r['queue_length'] = queue_lengths.get(r, 0)
+        else:
+            x_r = dict_x
+        if type(model) == DecisionRules:
+            resource_weights[r] = model.apply(x_r)
+        elif type(model) == float:
+            resource_weights[r] = model
         else:
             resource_weights[r] = 0
     return resource_weights
@@ -207,7 +219,18 @@ def count_working_minutes(start_ts: datetime, end_ts: datetime, calendar: dict, 
             current_time = end_of_hour
         else:
             current_time = (current_time + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-    return int(working_minutes)
+    return round(working_minutes)
+
+
+def snap_to_next_working_slot(ts: datetime, calendar: dict, _working_set: frozenset = None) -> datetime:
+    """If ts falls outside a working hour, advance to the start of the next working hour."""
+    working_set = _working_set if _working_set is not None else calendar_to_working_set(calendar)
+    current = ts
+    for _ in range(7 * 24):  # max 1 week lookahead
+        if (current.weekday(), current.hour) in working_set:
+            return current
+        current = (current + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    return ts  # calendar is empty or all-false, return as-is
 
 
 def add_minutes_with_calendar(start_ts: datetime, minutes_to_add: int, calendar: dict, _working_set: frozenset = None) -> datetime:
@@ -225,7 +248,7 @@ def add_minutes_with_calendar(start_ts: datetime, minutes_to_add: int, calendar:
             current_time += timedelta(minutes=minutes_in_current_hour)
             remaining_minutes -= minutes_in_current_hour
         else:
-            current_time = (current_time + timedelta(hours=1)).replace(minute=0)
+            current_time = (current_time + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
 
     return current_time
 
@@ -236,7 +259,7 @@ def get_transition_from_name(t_fired_name: str, net: PetriNet) -> PetriNet.Trans
             return t
         
 
-def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels, resources, label_data_attributes=[]):
+def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels, resources, label_data_attributes=[], firing_sequences=None):
 
     import numpy as np
 
@@ -253,8 +276,38 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
             'end_ts': sorted_group['time:timestamp'].values,
         }
 
-    aligned_traces = alignments.apply_log(log, net, im, fm, parameters={"ret_tuple_as_trans_desc": True})
     name_to_trans = {t.name: t for t in net.transitions}
+
+    if firing_sequences is not None:
+        # Fast path: the simulator already knows which transitions fired per
+        # case, so we can fabricate the same alignment structure pm4py would
+        # return and skip the (expensive) A* conformance check entirely.
+        aligned_traces = []
+        for trace in log:
+            cid = trace[0]["case:concept:name"]
+            seq = firing_sequences.get(cid, [])
+            alignment = []
+            for t_name in seq:
+                t = name_to_trans[t_name]
+                label = t.label
+                if label is None:
+                    # Silent transition → model move (log side is '>>').
+                    alignment.append(((t_name, t_name), ('>>', None)))
+                else:
+                    # Visible transition → sync move.
+                    alignment.append(((t_name, t_name), (label, label)))
+            aligned_traces.append({"alignment": alignment})
+    else:
+        try:
+            aligned_traces = alignments.apply_multiprocessing(
+                log, net, im, fm,
+                parameters={"ret_tuple_as_trans_desc": True},
+            )
+        except Exception:
+            aligned_traces = alignments.apply_log(
+                log, net, im, fm,
+                parameters={"ret_tuple_as_trans_desc": True},
+            )
 
     dataset = []
     for i, trace in enumerate(tqdm(log)):
@@ -298,9 +351,9 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
                 end_t = trace[j]["time:timestamp"]
                 enabled_t = transition_enabled_times[transition]
                 current_t = end_t
+                enabled_ts = enabled_t.timestamp()
                 if resource in resource_events:
                     re = resource_events[resource]
-                    enabled_ts = enabled_t.timestamp()
                     concurrent = (re['start_ts'] < enabled_ts) & (re['end_ts'] > enabled_ts)
                     res_workload = int(concurrent.sum())
                     if res_workload > 0:
@@ -310,6 +363,20 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
                 else:
                     res_workload = 0
                     resource_free_t = enabled_t
+                # Workload at enabled_t for every resource in the role pool of this activity.
+                # Used by the resource-assignment classifier to (i) filter negatives to
+                # resources that were actually free, and (ii) feed per-candidate workload
+                # as a feature, mirroring what the simulator does at inference time.
+                candidate_workloads = {}
+                for cand in act_to_resources.get(transition_label, []):
+                    if cand == resource:
+                        candidate_workloads[cand] = res_workload
+                    elif cand in resource_events:
+                        cre = resource_events[cand]
+                        cand_concurrent = (cre['start_ts'] < enabled_ts) & (cre['end_ts'] > enabled_ts)
+                        candidate_workloads[cand] = int(cand_concurrent.sum())
+                    else:
+                        candidate_workloads[cand] = 0
                 prev_enabled_resources = act_to_resources[transition_label]
                 j += 1
             else: # model move
@@ -320,6 +387,7 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
                 res_workload = None
                 resource_free_t = None
                 prev_enabled_resources = None
+                candidate_workloads = None
 
             del transition_enabled_times[transition]
             
@@ -327,7 +395,7 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
 
             handover_features = tuple(1 if r == last_resource else 0 for r in resources)
             last_activity_features = tuple(1 if t_l == last_activity else 0 for t_l in net_transition_labels)
-            dataset.append((case_id, transition, transition_label, resource, enabled_t, start_t, end_t, prev_enabled_transitions, prev_enabled_resources, res_workload, resource_free_t) + tuple(trace_attributes) + tuple(history_res.values()) + tuple(history.values()) + handover_features + last_activity_features)
+            dataset.append((case_id, transition, transition_label, resource, enabled_t, start_t, end_t, prev_enabled_transitions, prev_enabled_resources, res_workload, resource_free_t, candidate_workloads) + tuple(trace_attributes) + tuple(history_res.values()) + tuple(history.values()) + handover_features + last_activity_features)
 
             if transition_label:
                 history[transition_label] += 1
@@ -338,6 +406,54 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
 
     handover_from_cols = ['handover_from_' + r for r in resources]
     last_activity_cols = ['last_activity_' + t_l for t_l in net_transition_labels]
-    df = pd.DataFrame(dataset, columns=["case_id", "transition", "transition_label", "resource", "enabled_t", "start_t", "end_t", "prev_enabled_transitions", "prev_enabled_resources", "res_workload", "resource_free_t"] + label_data_attributes + resources + net_transition_labels + handover_from_cols + last_activity_cols)
+    df = pd.DataFrame(dataset, columns=["case_id", "transition", "transition_label", "resource", "enabled_t", "start_t", "end_t", "prev_enabled_transitions", "prev_enabled_resources", "res_workload", "resource_free_t", "candidate_workloads"] + label_data_attributes + resources + net_transition_labels + handover_from_cols + last_activity_cols)
+
+    # Per-resource sorted arrays of enabled_ts/start_ts, used for both the
+    # per-(event, chosen-resource) queue_length column and the per-(event,
+    # candidate-resource) queue_length values in candidate_queue_lengths.
+    # queue_at_q for r = |{i on r : enabled_ts_i <= q and start_ts_i > q}|
+    #                  = searchsorted_right(enabled_sorted, q)
+    #                    - searchsorted_right(start_sorted, q)
+    # because start_ts_i >= enabled_ts_i always holds.
+    per_res_sorted = {}
+    sync_mask_full = ~df['resource'].isna() & ~df['enabled_t'].isna() & ~df['start_t'].isna()
+    if sync_mask_full.any():
+        for resource, group in df[sync_mask_full].groupby('resource'):
+            enabled_arr = np.sort(np.array([et.timestamp() for et in group['enabled_t']]))
+            start_arr = np.sort(np.array([st.timestamp() for st in group['start_t']]))
+            per_res_sorted[resource] = (enabled_arr, start_arr)
+
+    # queue_length of the chosen resource at each event's enabled_t.
+    df['queue_length'] = 0
+    if sync_mask_full.any():
+        idx = df[sync_mask_full].index
+        for i in idx:
+            r = df.at[i, 'resource']
+            if r in per_res_sorted:
+                q = df.at[i, 'enabled_t'].timestamp()
+                enabled_arr, start_arr = per_res_sorted[r]
+                a = int(np.searchsorted(enabled_arr, q, side='right'))
+                b = int(np.searchsorted(start_arr, q, side='right'))
+                df.at[i, 'queue_length'] = a - b
+
+    # Per-candidate queue length at enabling time (used by the resource
+    # assignment classifier — mirrors candidate_workloads).
+    df['candidate_queue_lengths'] = None
+    if sync_mask_full.any():
+        for i in df[sync_mask_full].index:
+            cw = df.at[i, 'candidate_workloads']
+            if not isinstance(cw, dict):
+                continue
+            q = df.at[i, 'enabled_t'].timestamp()
+            cq = {}
+            for cand in cw.keys():
+                if cand in per_res_sorted:
+                    enabled_arr, start_arr = per_res_sorted[cand]
+                    a = int(np.searchsorted(enabled_arr, q, side='right'))
+                    b = int(np.searchsorted(start_arr, q, side='right'))
+                    cq[cand] = a - b
+                else:
+                    cq[cand] = 0
+            df.at[i, 'candidate_queue_lengths'] = cq
 
     return df
