@@ -79,7 +79,9 @@ class SimulatorParameters:
             max_depth_tree: int = 5,
             min_samples_leaf_cv: list = [5, 10, 20, 30],
             multitasking_thr: float = 0.05,
-            enable_multitasking: bool = False,
+            enable_multitasking: bool = True,
+            arrival_calendar_min_participation: float = 0.05,
+            res_calendar_min_participation: float = 0.05,
             attribute_mode: str = 'distribution',
             incremental_discovery: bool = False,
             grace_period: int = 1000,
@@ -190,8 +192,8 @@ class SimulatorParameters:
 
         if verbose:
             print("Calendars discovery...")
-        self.calendars = discover_res_calendars(log, self.resources)
-        self.arrival_calendar = discover_arrival_calendar(log)
+        self.calendars = discover_res_calendars(log, self.resources, min_participation=res_calendar_min_participation)
+        self.arrival_calendar = discover_arrival_calendar(log, min_participation=arrival_calendar_min_participation)
 
         if verbose:
             if incremental_discovery:
@@ -485,11 +487,10 @@ class SimulatorEngine:
                     else:
                         arrival_delta = sampled_arrivals[i]
                 else:
-                    hour = current_arr_ts.hour
-                    weekday = current_arr_ts.weekday()
                     arrival_features = {
-                        'hour': hour,
-                        'weekday': weekday,
+                        'hour': current_arr_ts.hour,
+                        'weekday': current_arr_ts.weekday(),
+                        'month': current_arr_ts.month,
                     }
                     if deterministic_time:
                         arrival_delta = self.simulation_parameters.arrival_time_distribution.apply(arrival_features)
@@ -596,12 +597,13 @@ class SimulatorEngine:
                     else:
                         waiting_activity_features = _zero_waiting_act.copy()
                         waiting_activity_features['waiting_activity = ' + activity] = 1
+                        res_free_time_features = {'resource_free_hour': t_enabled_waited.hour, 'resource_free_weekday': t_enabled_waited.weekday()}
                         if deterministic_time:
-                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply({'workload': r_workload, 'queue_length': r_queue_length} | case["history"] | case["attributes"] | waiting_activity_features)
+                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply({'workload': r_workload, 'queue_length': r_queue_length} | res_free_time_features | case["history"] | case["attributes"] | waiting_activity_features)
                             if not isinstance(waiting_time, (int, float)):
                                 waiting_time = 0
                         else:
-                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply_distribution({'workload': r_workload, 'queue_length': r_queue_length} | case["history"] | case["attributes"] | waiting_activity_features)
+                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply_distribution({'workload': r_workload, 'queue_length': r_queue_length} | res_free_time_features | case["history"] | case["attributes"] | waiting_activity_features)
 
                 t_start_exec = add_minutes_with_calendar(t_enabled_waited, round(max(0, waiting_time)), self.simulation_parameters.calendars[resource])
 
@@ -615,12 +617,13 @@ class SimulatorEngine:
                 else:
                     resource_onehot = _zero_resource_onehot.copy()
                     resource_onehot['resource = ' + resource] = 1
+                    start_time_features = {'start_hour': t_start_exec.hour, 'start_weekday': t_start_exec.weekday()}
                     if deterministic_time:
-                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply(resource_onehot | case["history"] | case["attributes"])
+                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply(resource_onehot | start_time_features | case["history"] | case["attributes"])
                         if not isinstance(ex_time, (int, float)):
                             ex_time = 0
                     else:
-                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply_distribution(resource_onehot | case["history"] | case["attributes"])
+                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply_distribution(resource_onehot | start_time_features | case["history"] | case["attributes"])
 
                 
                 t_end = add_minutes_with_calendar(t_start_exec, round(ex_time), self.simulation_parameters.calendars[resource])

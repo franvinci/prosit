@@ -237,15 +237,15 @@ def build_training_df_arrival(
     first_ts = df_log.groupby('case:concept:name')["start:timestamp"].min()
     ordered_first_ts_list = first_ts.sort_values().tolist()
 
-    dict_df = {'hour': [], 'weekday': [], 'arrival_time': []}
+    dict_df = {'hour': [], 'weekday': [], 'month': [], 'arrival_time': []}
     arrival_working_set = calendar_to_working_set(calendar_arrival)
 
     for i in range(1, len(ordered_first_ts_list)):
-        hour = ordered_first_ts_list[i-1].hour
-        weekday = ordered_first_ts_list[i-1].weekday()
-        dict_df['hour'].append(hour)
-        dict_df['weekday'].append(weekday)
-        dict_df['arrival_time'].append(count_working_minutes(ordered_first_ts_list[i-1], ordered_first_ts_list[i], calendar_arrival, arrival_working_set))
+        prev_ts = ordered_first_ts_list[i-1]
+        dict_df['hour'].append(prev_ts.hour)
+        dict_df['weekday'].append(prev_ts.weekday())
+        dict_df['month'].append(prev_ts.month)
+        dict_df['arrival_time'].append(count_working_minutes(prev_ts, ordered_first_ts_list[i], calendar_arrival, arrival_working_set))
 
     df = pd.DataFrame(dict_df)
 
@@ -267,6 +267,8 @@ def build_training_df_ex(
     df_et = df_et[~df_et["start_t"].isna()]
     working_sets_ex = {r: calendar_to_working_set(calendars[r]) for r in calendars}
     df_et["execution_time"] = df_et.apply(lambda x: count_working_minutes(x["start_t"], x["end_t"], calendars[x["resource"]], working_sets_ex[x["resource"]]), axis=1)
+    df_et["start_hour"] = df_et["start_t"].apply(lambda x: x.hour)
+    df_et["start_weekday"] = df_et["start_t"].apply(lambda x: x.weekday())
     df_et.drop(columns=["start_t", "end_t"], inplace=True)
     df_et.rename(columns={"transition_label": "activity_executed"}, inplace=True)
     df_et.reset_index(drop=True, inplace=True)
@@ -297,6 +299,8 @@ def build_training_df_wt(
     df_wt = df_wt[~df_wt["start_t"].isna()]
     working_sets_wt = {r: calendar_to_working_set(calendars[r]) for r in calendars}
     df_wt["waiting_time"] = df_wt.apply(lambda x: count_working_minutes(x["resource_free_t"], x["start_t"], calendars[x["resource"]], working_sets_wt[x["resource"]]), axis=1)
+    df_wt["resource_free_hour"] = df_wt["resource_free_t"].apply(lambda x: x.hour)
+    df_wt["resource_free_weekday"] = df_wt["resource_free_t"].apply(lambda x: x.weekday())
     df_wt.drop(columns=["start_t", "resource_free_t"], inplace=True)
     df_wt.rename(columns={"res_workload": "workload"}, inplace=True)
     df_wt.reset_index(drop=True, inplace=True)
