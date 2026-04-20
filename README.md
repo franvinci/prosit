@@ -119,7 +119,7 @@ Prosit extracts the following simulation parameters from an event log:
 
 ### Batch vs. incremental discovery
 
-- **Batch discovery** (default): Trains Decision Trees using `scikit-learn` with cross-validated hyperparameters (`max_depth`, `min_samples_leaf`, `max_features`).
+- **Batch discovery** (default): Trains Decision Trees using `scikit-learn` with cross-validated hyperparameters (`max_depth`, `min_samples_leaf`, `max_features`). Classification models (control flow, resource selection) also compare against a prior-only `DummyClassifier` inside the same CV grid — when no tree beats the prior, the model collapses to a single marginal probability.
 - **Incremental discovery** (`incremental_discovery=True`): Uses **Hoeffding Adaptive Trees** from the `river` library. Gives more weight to recent traces, suitable for concept drift or evolving processes.
 
 ---
@@ -140,10 +140,11 @@ Holds all simulation parameters. Initialise with the Petri net (typically discov
 params.discover_from_eventlog(
     log,
     max_depth_tree: int = 5,
-    min_samples_leaf_cv: list = [5, 10, 20, 30],
+    min_samples_leaf_cv: list = [50, 100, 200],
     multitasking_thr: float = 0.05,
-    enable_multitasking: bool = True,
-    attribute_mode: str = 'empirical',
+    enable_multitasking: bool = False,
+    attribute_mode: str = 'distribution',
+    use_workload_features: bool = False,
     incremental_discovery: bool = False,
     grace_period: int = 1000,
     random_state: int = 72,
@@ -157,10 +158,11 @@ Extracts all simulation parameters from the event log.
 |---|---|---|---|
 | `log` | `EventLog` | — | pm4py event log in XES format |
 | `max_depth_tree` | `int` | `5` | Maximum depth of decision trees. Higher = more expressive rules. Set to `0` to disable rules (pure distributions) |
-| `min_samples_leaf_cv` | `list` | `[5,10,20,30]` | Candidate values for `min_samples_leaf` in cross-validation. Controls the minimum number of samples per leaf — critical for reliable per-leaf distribution fitting |
+| `min_samples_leaf_cv` | `list` | `[50,100,200]` | Candidate values for `min_samples_leaf` in cross-validation. Controls the minimum number of samples per leaf — critical for reliable per-leaf distribution fitting |
 | `multitasking_thr` | `float` | `0.05` | Minimum fraction of events with concurrent workload > 0 for a resource to be considered multitasking. Below this, capacity is set to 1 |
-| `enable_multitasking` | `bool` | `True` | If `False`, all resources are forced to capacity 1 (no parallel task execution) regardless of what the log shows |
-| `attribute_mode` | `str` | `'empirical'` | How to model case-level data attributes. `'empirical'`: samples from the joint observed distribution (preserves correlations). `'distribution'`: fits each attribute independently (categorical → frequency table, continuous → best-fitting scipy distribution) |
+| `enable_multitasking` | `bool` | `False` | If `True`, resources whose log exhibits concurrent workload above `multitasking_thr` get a capacity > 1 (parallel task execution). Default `False`: all resources capacity 1 |
+| `attribute_mode` | `str` | `'distribution'` | How to model case-level data attributes. `'distribution'`: fits each attribute independently (categorical → frequency table, continuous → best-fitting scipy distribution). `'empirical'`: samples from the joint observed distribution (preserves correlations) |
+| `use_workload_features` | `bool` | `False` | If `True`, resource-selection and waiting-time models receive two extra features per candidate resource: current `workload` (concurrent tasks) and `queue_length` (tasks scheduled but not yet started) at the enabling time |
 | `incremental_discovery` | `bool` | `False` | Use Hoeffding Adaptive Trees instead of scikit-learn. Gives more weight to recent traces |
 | `grace_period` | `int` | `1000` | (Incremental only) Number of observations before the tree considers splitting a node |
 | `random_state` | `int` | `72` | Seed for all random operations (reproducibility) |
@@ -364,7 +366,7 @@ params = SimulatorParameters(net, im, fm)
 params.discover_from_eventlog(
     train_log,
     max_depth_tree=3,
-    min_samples_leaf_cv=[5, 10, 20, 30],
+    min_samples_leaf_cv=[50, 100, 200],
     random_state=42,
     verbose=True
 )
@@ -451,12 +453,14 @@ print(params.distribution_data_attributes)
 | Model | Tree type | Conditional on |
 |---|---|---|
 | Arrival time | Regressor | Hour of day, weekday |
-| Execution time | Regressor | Resource identity (one-hot), activity execution history, case attributes |
-| Waiting time | Regressor | Resource workload, activity being executed (one-hot), activity history, case attributes |
-| Control flow | Classifier | Activity execution history, last activity executed (one-hot), case attributes |
-| Resource selection | Classifier (per activity) | Resource usage history (counts), case attributes |
+| Execution time | Regressor | Resource identity (one-hot), case attributes |
+| Waiting time | Regressor (per resource) | Activity being waited for (one-hot), case attributes; optionally `workload` and `queue_length` when `use_workload_features=True` |
+| Control flow | Classifier (per transition) | Activity execution history (counts), case attributes |
+| Resource selection | Classifier (per resource) | Handover from previous resource (one-hot), activity being executed (one-hot), case attributes; optionally `workload` and `queue_length` when `use_workload_features=True` |
 
 History features are expressed as **raw counts** (number of times each activity has been executed in the case so far), so that decision tree rules are directly interpretable (e.g. `"Approve" <= 2` means "Approve has been executed at most 2 times").
+
+Before each classifier or regressor is fit, low-signal columns are pruned automatically: constant columns are dropped, and one-hot columns (resources, activities, categorical attribute values) with fewer than 20 positive observations in the current training slice are removed. This reduces noise from rare categories and keeps the CV grid compact.
 
 ### Distribution fitting
 
@@ -466,5 +470,5 @@ For each leaf node of a regression tree, Prosit fits the best distribution among
 
 Case-level data attributes (e.g. `case:type`, `case:priority`) are discovered automatically and sampled at case arrival time. Two modes are available via `attribute_mode`:
 
-- **`'empirical'`** (default): samples complete attribute tuples from the observed joint distribution — preserves correlations between attributes.
-- **`'distribution'`**: fits each attribute independently (categorical → frequency table, continuous → best-fitting scipy distribution). Useful when the log is small or attributes are largely independent.
+- **`'distribution'`** (default): fits each attribute independently (categorical → frequency table, continuous → best-fitting scipy distribution). Useful when the log is small or attributes are largely independent.
+- **`'empirical'`**: samples complete attribute tuples from the observed joint distribution — preserves correlations between attributes.

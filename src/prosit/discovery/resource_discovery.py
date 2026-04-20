@@ -6,8 +6,10 @@ from tqdm import tqdm
 
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import GridSearchCV
+from sklearn.dummy import DummyClassifier
+from sklearn.pipeline import Pipeline
 
-from prosit.utils.rule_utils import DecisionRules, apply_laplace_smoothing, BINARY_NEG_LOG_LOSS_SCORER
+from prosit.utils.rule_utils import DecisionRules, apply_laplace_smoothing, BINARY_NEG_LOG_LOSS_SCORER, prune_low_signal_columns
 
 
 def discover_resources_list(log: EventLog) -> list:
@@ -56,19 +58,21 @@ def discover_weight_resources(
         resources: list,
         max_concurrency: dict,
         max_depths_cv: list = range(1,6),
-        min_samples_leaf_cv: list = [5, 10, 20],
+        min_samples_leaf_cv: list = [50, 100, 200],
         label_data_attributes: list = [],
         label_data_attributes_categorical: list = [],
         values_categorical: dict = dict(),
-        random_state: int = 72
+        random_state: int = 72,
+        use_workload_features: bool = False
     ) -> dict :
     """Return ``{resource: classifier}``.
 
     One binary classifier per resource, trained on events where the resource
     was a candidate (i.e. in the activity's role pool) AND was actually free
     at the enabling time (workload below its max concurrency). Features are
-    per-resource history counts, case attributes, and the resource's own
-    workload at enabling time. This matches the simulator's inference path:
+    per-resource history counts, case attributes, and — when
+    ``use_workload_features`` is True — the resource's own workload and queue
+    length at enabling time. This matches the simulator's inference path:
     the classifier is invoked only on free candidates, so training must
     mirror that conditional distribution.
     """
@@ -107,7 +111,8 @@ def discover_weight_resources(
         label_data_attributes,
         label_data_attributes_categorical,
         values_categorical,
-        random_state=random_state
+        random_state=random_state,
+        use_workload_features=use_workload_features
     )
 
 
@@ -117,14 +122,23 @@ def build_models(
         resources: list,
         max_concurrency: dict,
         max_depths_cv: list = range(1,6),
-        min_samples_leaf_cv: list = [5, 10, 20],
+        min_samples_leaf_cv: list = [50, 100, 200],
         label_data_attributes: list = [],
         label_data_attributes_categorical: list = [],
         values_categorical: dict = dict(),
-        random_state: int = 72
+        random_state: int = 72,
+        use_workload_features: bool = False
     ) -> dict :
 
-    param_grid = {'max_depth': max_depths_cv, 'min_samples_leaf': min_samples_leaf_cv, 'max_features': [None, 'sqrt']}
+    param_grid = [
+        {
+            'clf': [DecisionTreeClassifier(random_state=random_state)],
+            'clf__max_depth': list(max_depths_cv),
+            'clf__min_samples_leaf': list(min_samples_leaf_cv),
+            'clf__max_features': [None, 'sqrt'],
+        },
+        {'clf': [DummyClassifier(strategy='prior', random_state=random_state)]},
+    ]
 
     datasets = build_training_datasets(
         df_features,
@@ -132,6 +146,7 @@ def build_models(
         resources,
         max_concurrency,
         label_data_attributes,
+        use_workload_features=use_workload_features,
     )
 
     models = dict()
@@ -148,21 +163,26 @@ def build_models(
             del data_r[a]
 
         X = data_r.drop(columns=['class'])
+        X = prune_low_signal_columns(X)
         y = data_r['class']
 
         if max_depths_cv:
-            clf_dtc = DecisionTreeClassifier(random_state=random_state)
+            pipe = Pipeline([('clf', DecisionTreeClassifier(random_state=random_state))])
             try:
                 grid_search = GridSearchCV(
-                    estimator=clf_dtc,
+                    estimator=pipe,
                     param_grid=param_grid,
                     cv=3,
                     scoring=BINARY_NEG_LOG_LOSS_SCORER,
                 ).fit(X, y)
-                clf_dtc = grid_search.best_estimator_
+                best_clf = grid_search.best_estimator_.named_steps['clf']
             except Exception:
-                clf_dtc = DecisionTreeClassifier(max_depth=2, random_state=random_state)
-                clf_dtc.fit(X, y)
+                best_clf = DecisionTreeClassifier(max_depth=2, random_state=random_state).fit(X, y)
+
+            if isinstance(best_clf, DummyClassifier):
+                models[r] = float(y.mean())
+                continue
+            clf_dtc = best_clf
         else:
             clf_dtc = DecisionTreeClassifier(random_state=random_state, max_depth=1)
             clf_dtc.fit(X, y)
@@ -196,19 +216,22 @@ def build_training_datasets(
         resources: list,
         max_concurrency: dict,
         label_data_attributes: list,
+        use_workload_features: bool = False,
     ) -> dict:
     """Return ``{resource: training_df}``.
 
     One training set per resource. Scope: events whose activity has the
     resource in its candidate pool AND where the resource was actually free
     (``workload < max_concurrency[r]``) at the enabling time. Features:
-    per-resource history counts, case attributes, and the resource's own
-    workload at enabling time. Target ``class`` is ``1`` when this resource
-    actually performed the event, ``0`` otherwise.
+    last-resource one-hot (handover), current-activity one-hot, and
+    enabled-time hour/weekday/month. When ``use_workload_features`` is True
+    the resource's own workload and queue length at enabling time are
+    appended. Target ``class`` is ``1`` when this resource actually
+    performed the event, ``0`` otherwise.
     """
 
-    res_history_cols = list(resources)
-    feature_cols = res_history_cols + list(label_data_attributes)
+    handover_cols = ['handover_from_' + r for r in resources]
+    act_labels = list(act_to_resources.keys())
 
     r_to_acts = _resource_to_eligible_acts(act_to_resources, resources)
 
@@ -229,14 +252,18 @@ def build_training_datasets(
         workload_r = workload_r[free_mask]
         if df_scope.empty:
             continue
-        queue_r = df_scope['candidate_queue_lengths'].apply(
-            lambda d: d.get(r, 0) if isinstance(d, dict) else 0
-        )
-        base = df_scope[feature_cols].reset_index(drop=True)
+        base = df_scope[handover_cols + list(label_data_attributes) + ["transition_label"]].reset_index(drop=True)
+        for a in act_labels:
+            base['activity = ' + a] = (base['transition_label'] == a).astype(int)
+        base = base.drop(columns=['transition_label'])
         actual = df_scope['resource'].reset_index(drop=True)
-        df_r = base.copy()
-        df_r['workload'] = workload_r.reset_index(drop=True).values
-        df_r['queue_length'] = queue_r.reset_index(drop=True).values
+        df_r = base
+        if use_workload_features:
+            queue_r = df_scope['candidate_queue_lengths'].apply(
+                lambda d: d.get(r, 0) if isinstance(d, dict) else 0
+            )
+            df_r['workload'] = workload_r.reset_index(drop=True).values
+            df_r['queue_length'] = queue_r.reset_index(drop=True).values
         df_r['class'] = (actual == r).astype(int).values
         datasets[r] = df_r
 

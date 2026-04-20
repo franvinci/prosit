@@ -22,6 +22,7 @@ from prosit.utils.common_utils import (
     update_current_marking,
     return_fired_transition,
     count_concurrent_events,
+    is_resource_busy,
     compute_transition_weights_from_model,
     add_minutes_with_calendar,
     build_df_features,
@@ -71,31 +72,35 @@ class SimulatorParameters:
         self.waiting_time_distributions: dict = {'auto': ('fixed', 1, 1, 1, 1)}
 
         self.rules_mode: bool = False
+        self.use_workload_features: bool = False
 
 
     def discover_from_eventlog(
             self,
             log: EventLog,
             max_depth_tree: int = 5,
-            min_samples_leaf_cv: list = [5, 10, 20, 30],
+            min_samples_leaf_cv: list = [50, 100, 200],
             multitasking_thr: float = 0.05,
-            enable_multitasking: bool = True,
+            enable_multitasking: bool = False,
             arrival_calendar_min_participation: float = 0.05,
             res_calendar_min_participation: float = 0.05,
             attribute_mode: str = 'distribution',
             incremental_discovery: bool = False,
             grace_period: int = 1000,
             random_state: int = 72,
-            verbose: bool = True
+            verbose: bool = True,
+            use_workload_features: bool = False
         ):
         """ Discovery Parameters from event log data """
+
+        self.use_workload_features = use_workload_features
 
         if max_depth_tree < 1:
             self.rules_mode = False
             max_depth_cv = []
         else:
             self.rules_mode = True
-            max_depth_cv = range(1, max_depth_tree + 1)
+            max_depth_cv = list(range(1, max_depth_tree + 1))
         
         self.label_data_attributes, self.label_data_attributes_categorical = return_label_data_attributes(log)
         
@@ -187,7 +192,8 @@ class SimulatorParameters:
                                                                 self.label_data_attributes,
                                                                 self.label_data_attributes_categorical,
                                                                 self.attribute_values_label_categorical,
-                                                                random_state=random_state
+                                                                random_state=random_state,
+                                                                use_workload_features=use_workload_features
                                                             )
 
         if verbose:
@@ -255,7 +261,8 @@ class SimulatorParameters:
                                                                         self.attribute_values_label_categorical,
                                                                         max_depths=max_depth_cv,
                                                                         min_samples_leaf_cv=min_samples_leaf_cv,
-                                                                        random_state=random_state
+                                                                        random_state=random_state,
+                                                                        use_workload_features=use_workload_features
                                                                     )
         
         if verbose:
@@ -286,6 +293,7 @@ class SimulatorParameters:
         dict_params = {
 
             "rules_mode": self.rules_mode,
+            "use_workload_features": self.use_workload_features,
 
             "transition_params": {
                 "transition_weights": {transition_to_name(t): decision_rules_to_dict(dr) for t, dr in self.transition_weights.items()} # ok
@@ -339,6 +347,7 @@ class SimulatorParameters:
         else:
             # Backward compatibility: infer from old format
             self.rules_mode = "mean_value" not in dict_params["arrival_params"]["arrival_time_distributions"].keys()
+        self.use_workload_features = dict_params.get("use_workload_features", False)
         self.label_data_attributes, self.label_data_attributes_categorical = dict_params["data_attribute_params"]["label_data_attributes"], dict_params["data_attribute_params"]["label_data_attributes_categorical"]
         self.attribute_values_label_categorical = dict_params["data_attribute_params"]["attribute_values_label_categorical"]
         raw_dist_attrs = dict_params["data_attribute_params"]["distribution_data_attributes"]
@@ -490,7 +499,6 @@ class SimulatorEngine:
                     arrival_features = {
                         'hour': current_arr_ts.hour,
                         'weekday': current_arr_ts.weekday(),
-                        'month': current_arr_ts.month,
                     }
                     if deterministic_time:
                         arrival_delta = self.simulation_parameters.arrival_time_distribution.apply(arrival_features)
@@ -528,14 +536,15 @@ class SimulatorEngine:
 
             cases.append(case)
 
-        _zero_last_activity = {'last_activity_' + t_l: 0 for t_l in self.simulation_parameters.net_transition_labels}
         _zero_waiting_act = {'waiting_activity = ' + act_label: 0 for act_label in self.simulation_parameters.net_transition_labels}
         _zero_resource_onehot = {'resource = ' + res: 0 for res in self.simulation_parameters.resources}
+        _zero_handover = {'handover_from_' + res: 0 for res in self.simulation_parameters.resources}
+        _zero_activity_onehot = {'activity = ' + act_label: 0 for act_label in self.simulation_parameters.net_transition_labels}
 
         completed_cases = set()
         pbar = tqdm(total=n_traces, desc="Simulating Cases")
         while enabled_heap:
-            _, case_id = heapq.heappop(enabled_heap)
+            decision_time, case_id = heapq.heappop(enabled_heap)
             case = cases[case_id]
 
             if not case["enabled"]:
@@ -546,10 +555,7 @@ class SimulatorEngine:
             if not self.simulation_parameters.rules_mode:
                 transition_weights = self.simulation_parameters.transition_weights
             else:
-                last_activity_features = _zero_last_activity.copy()
-                if case["last_activity"]:
-                    last_activity_features['last_activity_' + case["last_activity"]] = 1
-                transition_weights = compute_transition_weights_from_model(self.simulation_parameters.transition_weights, case["attributes"] | case["history"] | last_activity_features, enabled_transitions)
+                transition_weights = compute_transition_weights_from_model(self.simulation_parameters.transition_weights, case["attributes"] | case["history"], enabled_transitions)
             chosen_transition = return_fired_transition(transition_weights, enabled_transitions)
             activity = chosen_transition.label
             t_enabled = case["enabled"][chosen_transition]
@@ -557,12 +563,24 @@ class SimulatorEngine:
 
             if activity is not None:
                 enabled_resources_act = self.simulation_parameters.act_to_resources[activity]
-                workloads = {r: count_concurrent_events(resource_schedule[r], t_enabled) for r in enabled_resources_act}
-                queue_lengths_cand = {r: sum(1 for s, _ in resource_schedule[r] if s > t_enabled) for r in enabled_resources_act}
-                enabled_resources = []
-                for r in enabled_resources_act:
-                    if workloads[r] < self.simulation_parameters.max_concurrency.get(r, 1):
-                        enabled_resources.append(r)
+                uwf = self.simulation_parameters.use_workload_features
+                mc = self.simulation_parameters.max_concurrency
+                if uwf:
+                    workloads = {r: count_concurrent_events(resource_schedule[r], t_enabled) for r in enabled_resources_act}
+                    queue_lengths_cand = {r: sum(1 for s, _ in resource_schedule[r] if s > t_enabled) for r in enabled_resources_act}
+                    enabled_resources = [r for r in enabled_resources_act if workloads[r] < mc.get(r, 1)]
+                else:
+                    workloads = None
+                    queue_lengths_cand = None
+                    enabled_resources = []
+                    for r in enabled_resources_act:
+                        max_c = mc.get(r, 1)
+                        if max_c == 1:
+                            if not is_resource_busy(resource_schedule[r], t_enabled):
+                                enabled_resources.append(r)
+                        else:
+                            if count_concurrent_events(resource_schedule[r], t_enabled) < max_c:
+                                enabled_resources.append(r)
                 if not enabled_resources:
                     t_enabled_enabled_resources = [resource_schedule[r][-1][-1] if resource_schedule[r] else t_enabled for r in enabled_resources_act]
                     index_res, t_enabled_waited = min(enumerate(t_enabled_enabled_resources), key=lambda x: x[1])
@@ -571,17 +589,31 @@ class SimulatorEngine:
                     if not self.simulation_parameters.rules_mode:
                         resource_weights = {r: self.simulation_parameters.resource_weights.get(r, 0.0) for r in enabled_resources}
                     else:
-                        resource_weights = compute_resource_weights_from_model(
-                            self.simulation_parameters.resource_weights,
-                            enabled_resources,
-                            case["res_history"] | case["attributes"],
-                            workloads=workloads,
-                            queue_lengths=queue_lengths_cand,
-                        )
+                        handover_features = _zero_handover.copy()
+                        if case["last_resource"] is not None:
+                            handover_features['handover_from_' + case["last_resource"]] = 1
+                        activity_onehot = _zero_activity_onehot.copy()
+                        activity_onehot['activity = ' + activity] = 1
+                        res_features = handover_features | activity_onehot | case["attributes"]
+                        if uwf:
+                            resource_weights = compute_resource_weights_from_model(
+                                self.simulation_parameters.resource_weights,
+                                enabled_resources,
+                                res_features,
+                                workloads=workloads,
+                                queue_lengths=queue_lengths_cand,
+                            )
+                        else:
+                            resource_weights = compute_resource_weights_from_model(
+                                self.simulation_parameters.resource_weights,
+                                enabled_resources,
+                                res_features,
+                            )
                     resource = return_resource(resource_weights, enabled_resources)
                     t_enabled_waited = t_enabled
-                r_workload = workloads[resource]
-                r_queue_length = sum(1 for s, e in resource_schedule[resource] if s > t_enabled)
+                if uwf:
+                    r_workload = workloads[resource]
+                    r_queue_length = sum(1 for s, e in resource_schedule[resource] if s > t_enabled)
                 case["res_history"][resource] += 1
 
                 if sum(case["history"].values()) == 0:
@@ -597,13 +629,16 @@ class SimulatorEngine:
                     else:
                         waiting_activity_features = _zero_waiting_act.copy()
                         waiting_activity_features['waiting_activity = ' + activity] = 1
-                        res_free_time_features = {'resource_free_hour': t_enabled_waited.hour, 'resource_free_weekday': t_enabled_waited.weekday()}
+                        if uwf:
+                            wt_features = {'workload': r_workload, 'queue_length': r_queue_length} | waiting_activity_features | case["attributes"]
+                        else:
+                            wt_features = waiting_activity_features | case["attributes"]
                         if deterministic_time:
-                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply({'workload': r_workload, 'queue_length': r_queue_length} | res_free_time_features | case["history"] | case["attributes"] | waiting_activity_features)
+                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply(wt_features)
                             if not isinstance(waiting_time, (int, float)):
                                 waiting_time = 0
                         else:
-                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply_distribution({'workload': r_workload, 'queue_length': r_queue_length} | res_free_time_features | case["history"] | case["attributes"] | waiting_activity_features)
+                            waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply_distribution(wt_features)
 
                 t_start_exec = add_minutes_with_calendar(t_enabled_waited, round(max(0, waiting_time)), self.simulation_parameters.calendars[resource])
 
@@ -617,13 +652,12 @@ class SimulatorEngine:
                 else:
                     resource_onehot = _zero_resource_onehot.copy()
                     resource_onehot['resource = ' + resource] = 1
-                    start_time_features = {'start_hour': t_start_exec.hour, 'start_weekday': t_start_exec.weekday()}
                     if deterministic_time:
-                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply(resource_onehot | start_time_features | case["history"] | case["attributes"])
+                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply(resource_onehot | case["attributes"])
                         if not isinstance(ex_time, (int, float)):
                             ex_time = 0
                     else:
-                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply_distribution(resource_onehot | start_time_features | case["history"] | case["attributes"])
+                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply_distribution(resource_onehot | case["attributes"])
 
                 
                 t_end = add_minutes_with_calendar(t_start_exec, round(ex_time), self.simulation_parameters.calendars[resource])

@@ -23,6 +23,28 @@ BINARY_NEG_LOG_LOSS_SCORER = make_scorer(
 
 MAX_DURATION_MINUTES = 60 * 24  # 1440 minutes = 24 hours
 DEFAULT_SAMPLE_SIZE = 1000
+MIN_FEATURE_POSITIVES = 20
+
+
+def prune_low_signal_columns(X: pd.DataFrame, min_positives: int = MIN_FEATURE_POSITIVES) -> pd.DataFrame:
+    """Drop columns with zero variance or binary 0/1 columns with fewer than
+    ``min_positives`` positives. One-hot features for resources/activities
+    rarely or never seen in this training slice contribute only noise and
+    bloat the GridSearchCV split candidates.
+    """
+    if X.empty:
+        return X
+    keep = []
+    for col in X.columns:
+        series = X[col]
+        unique = pd.unique(series)
+        if len(unique) < 2:
+            continue
+        if set(unique).issubset({0, 1, 0.0, 1.0}):
+            if int(series.sum()) < min_positives:
+                continue
+        keep.append(col)
+    return X[keep]
 
 
 def apply_laplace_smoothing(clf, alpha: float = 1.0):

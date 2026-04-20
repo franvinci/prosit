@@ -4,8 +4,10 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import GridSearchCV
+from sklearn.dummy import DummyClassifier
+from sklearn.pipeline import Pipeline
 
-from prosit.utils.rule_utils import DecisionRules, apply_laplace_smoothing, BINARY_NEG_LOG_LOSS_SCORER
+from prosit.utils.rule_utils import DecisionRules, apply_laplace_smoothing, BINARY_NEG_LOG_LOSS_SCORER, prune_low_signal_columns
 
 
 
@@ -14,7 +16,7 @@ def discover_weight_transitions(
         df_features: pd.DataFrame,
         net_transition_labels: list,
         max_depths_cv: list = range(1, 6),
-        min_samples_leaf_cv: list = [5, 10, 20],
+        min_samples_leaf_cv: list = [50, 100, 200],
         label_data_attributes: list = [],
         label_data_attributes_categorical: list = [],
         values_categorical: dict = dict(),
@@ -49,7 +51,7 @@ def build_models(
         values_categorical: dict,
         model_type: str = 'DecisionTree',
         max_depths_cv: list = range(1,6),
-        min_samples_leaf_cv: list = [5, 10, 20],
+        min_samples_leaf_cv: list = [50, 100, 200],
         random_state: int = 72
     ) -> dict :
 
@@ -59,7 +61,15 @@ def build_models(
                     label_data_attributes
                 )
 
-    param_grid = {'max_depth': max_depths_cv, 'min_samples_leaf': min_samples_leaf_cv, 'max_features': [None, 'sqrt']}
+    param_grid = [
+        {
+            'clf': [DecisionTreeClassifier(random_state=random_state)],
+            'clf__max_depth': list(max_depths_cv),
+            'clf__min_samples_leaf': list(min_samples_leaf_cv),
+            'clf__max_features': [None, 'sqrt'],
+        },
+        {'clf': [DummyClassifier(strategy='prior', random_state=random_state)]},
+    ]
 
     models_t = dict()
     
@@ -78,6 +88,7 @@ def build_models(
             del data_t[a]
 
         X = data_t.drop(columns=['class'])
+        X = prune_low_signal_columns(X)
         y = data_t['class']
 
         if model_type == 'LogisticRegression':
@@ -86,18 +97,22 @@ def build_models(
         elif model_type == 'DecisionTree':
 
             if max_depths_cv:
-                clf_t_dtc = DecisionTreeClassifier(random_state=random_state)
+                pipe = Pipeline([('clf', DecisionTreeClassifier(random_state=random_state))])
                 try:
                     grid_search = GridSearchCV(
-                        estimator=clf_t_dtc,
+                        estimator=pipe,
                         param_grid=param_grid,
                         cv=3,
                         scoring=BINARY_NEG_LOG_LOSS_SCORER,
                     ).fit(X, y)
-                    clf_t_dtc = grid_search.best_estimator_
+                    best_clf = grid_search.best_estimator_.named_steps['clf']
                 except Exception:
-                    clf_t_dtc = DecisionTreeClassifier(max_depth=2, random_state=random_state)
-                    clf_t_dtc.fit(X, y)
+                    best_clf = DecisionTreeClassifier(max_depth=2, random_state=random_state).fit(X, y)
+
+                if isinstance(best_clf, DummyClassifier):
+                    models_t[t] = float(y.mean())
+                    continue
+                clf_t_dtc = best_clf
             else:
                 clf_t_dtc = DecisionTreeClassifier(random_state=random_state, max_depth=1)
                 clf_t_dtc.fit(X, y)
@@ -115,19 +130,18 @@ def build_models(
 
 def build_training_datasets(
         df_features: pd.DataFrame,
-        net_transition_labels: list, 
+        net_transition_labels: list,
         label_data_attributes: list
     ) -> dict:
 
-    last_activity_cols = ['last_activity_' + t_l for t_l in net_transition_labels]
-    df_cf = df_features[["transition"] + ["prev_enabled_transitions"] + label_data_attributes + net_transition_labels + last_activity_cols]
+    df_cf = df_features[["transition", "prev_enabled_transitions"] + label_data_attributes + net_transition_labels].copy()
 
     df_cf = df_cf.explode('prev_enabled_transitions')
     df_cf['class'] = (df_cf['prev_enabled_transitions'] == df_cf['transition']).astype(int)
 
     df_cf = df_cf.drop(columns=['transition'])
     df_cf = df_cf.rename(columns={'prev_enabled_transitions': 'transition'})
-        
+
     datasets_t = {t: group.drop(columns=['transition']).reset_index(drop=True) for t, group in df_cf.groupby('transition', sort=False)}
 
     return datasets_t

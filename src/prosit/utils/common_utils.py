@@ -179,8 +179,17 @@ def count_concurrent_events(schedule, t_enabled) -> int:
             break
         if start <= t_enabled < end:
             count += 1
-            
+
     return count
+
+
+def is_resource_busy(schedule, t_enabled) -> bool:
+    for start, end in reversed(schedule):
+        if end <= t_enabled:
+            return False
+        if start <= t_enabled < end:
+            return True
+    return False
 
 
 def count_false_hours(calendar: dict, start_ts: datetime, end_ts: datetime) -> int:
