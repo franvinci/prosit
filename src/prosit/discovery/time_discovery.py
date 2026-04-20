@@ -201,6 +201,9 @@ def _fit_decision_rules(X, y, param_grid, max_depths, random_state, use_outlier_
     if isinstance(X, pd.DataFrame):
         X = prune_low_signal_columns(X)
 
+    if hasattr(X, 'shape') and X.shape[1] == 0:
+        return _build_no_rule_decision_rules(y, use_outlier_removal=use_outlier_removal)
+
     if max_depths:
         if len(X) > 6:
             X_arr = X.values if hasattr(X, 'values') else np.asarray(X)
