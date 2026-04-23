@@ -79,11 +79,44 @@ def return_label_data_attributes(log: EventLog) -> tuple:
         "start:timestamp", "org:resource", "org:role"
     }
 
+    import pandas as pd
+
     df_log = pm4py.convert_to_dataframe(log)
     label_data_attributes = list(set(df_log.columns) - standard_xes_columns)
 
-    label_data_attributes_categorical = [
-        l for l in label_data_attributes if df_log[l].dtype == 'object'
-    ]
+    # String-typed attributes that parse as numeric for every non-null value
+    # (e.g. BPI12's ``case:AMOUNT_REQ`` stored as "20000") are treated as
+    # continuous, not categorical — otherwise each distinct value becomes a
+    # one-hot column and most are pruned as low-signal.
+    label_data_attributes_categorical = []
+    numeric_attrs = []
+    for l in label_data_attributes:
+        col = df_log[l]
+        if col.dtype == 'object':
+            coerced = pd.to_numeric(col, errors='coerce')
+            non_null_src = col.notna().sum()
+            if non_null_src > 0 and coerced.notna().sum() == non_null_src:
+                numeric_attrs.append(l)
+            else:
+                label_data_attributes_categorical.append(l)
+
+    # Coerce values in place on the log so downstream consumers (the training
+    # df builders, which read via ``trace[0][a]``) see floats. ``convert_to_dataframe``
+    # above has already broadcast case-level attributes onto every event.
+    if numeric_attrs:
+        for trace in log:
+            for a in numeric_attrs:
+                short_a = a[5:] if a.startswith('case:') else a
+                if short_a in trace.attributes:
+                    try:
+                        trace.attributes[short_a] = float(trace.attributes[short_a])
+                    except (ValueError, TypeError):
+                        pass
+                for event in trace:
+                    if a in event:
+                        try:
+                            event[a] = float(event[a])
+                        except (ValueError, TypeError):
+                            pass
 
     return label_data_attributes, label_data_attributes_categorical

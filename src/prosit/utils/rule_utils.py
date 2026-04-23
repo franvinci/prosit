@@ -139,12 +139,11 @@ def parse_tree(dot_string):
 
 
 def build_tree_structure(nodes, edges):
-    tree = {}
-
     def add_edge(parent, child, edge_index):
         if 'children' not in nodes[parent]:
             nodes[parent]['children'] = {}
-        condition = (edge_index == 0)  # True for left (first edge), False for right (second edge)
+        # First edge encountered for a parent is the left (True) branch, second is right (False).
+        condition = (edge_index == 0)
         nodes[parent]['children'][condition] = child
 
     parent_edge_count = {}
@@ -216,13 +215,11 @@ def transform_river_decision_tree_data(decision_tree, distribution=True, min_val
             pred_split = mean_var.split("\n")[-2].split(" | ")
             value = float(pred_split[0][6:].replace(",", ""))
             variance = float(pred_split[1][5:].replace(",", ""))
-            # Calculate standard deviation, ensuring variance is non-negative
             std_dev = np.sqrt(max(0, variance))
-            
+
             if std_dev == 0:
                 sampled_values = [value]
             else:
-                # Sample 100 values from a normal distribution
                 sampled_values = np.random.normal(loc=value, scale=std_dev, size=DEFAULT_SAMPLE_SIZE)
                 sampled_values[sampled_values < min_value] = value
                 sampled_values[sampled_values > max_value] = value
@@ -235,31 +232,23 @@ def transform_river_decision_tree_data(decision_tree, distribution=True, min_val
 
     transformed_data = {}
 
-    # Iterate over each row in the DataFrame to process nodes
-    # Use row.name to get the index (which is the node ID)
     for node_id, row in df.iterrows():
         is_leaf = row['is_leaf']
 
-        # Check if it's a decision node based on 'is_leaf' and presence of 'feature'/'threshold'
         if not is_leaf and pd.notna(row['feature']) and pd.notna(row['threshold']):
             feature = row['feature']
             threshold = row['threshold']
 
-            # Find immediate children nodes by filtering the DataFrame
-            # Children are identified by having the current node's ID as their 'parent'
-            children_nodes_df = df[df['parent'] == node_id].sort_values(df.index.name if df.index.name else df.index.values[0]) # Adjusted for index as node ID
-            children_node_ids = children_nodes_df.index.tolist() # Get index values as children IDs
+            children_nodes_df = df[df['parent'] == node_id].sort_index()
+            children_node_ids = children_nodes_df.index.tolist()
 
             children_dict = {}
-            # Assuming a binary tree structure, assign children based on their node IDs
-            # The smaller node ID is typically associated with the 'False' branch, larger with 'True'
+            # Binary tree: smaller child id is the 'False' branch, larger the 'True' branch.
             if len(children_node_ids) == 2:
                 children_dict[False] = int(children_node_ids[0])
                 children_dict[True] = int(children_node_ids[1])
             elif len(children_node_ids) == 1:
-                # If only one child, assign it to 'True' as a default assumption
                 children_dict[True] = int(children_node_ids[0])
-            # If no children are found, children_dict remains empty
 
             transformed_data[node_id] = {
                 'feature': feature,
@@ -267,20 +256,15 @@ def transform_river_decision_tree_data(decision_tree, distribution=True, min_val
                 'children': children_dict
             }
         else:
-            # This is a leaf node (or a node that cannot be a decision node due to missing data)
-            # Assign a default 'value' for leaf nodes as it's not present in the dataset
-            
             if distribution:
                 value = row['stats'].mean.get()
                 variance = row['stats'].get()
 
-                # Calculate standard deviation, ensuring variance is non-negative
                 std_dev = np.sqrt(max(0, variance))
-                
+
                 if std_dev == 0:
                     sampled_values = [value]
                 else:
-                    # Sample 100 values from a normal distribution
                     sampled_values = np.random.normal(loc=value, scale=std_dev, size=max(DEFAULT_SAMPLE_SIZE, int(row['stats'].n)))
                     sampled_values[sampled_values < min_value] = value
                     sampled_values[sampled_values > max_value] = value
@@ -295,7 +279,6 @@ def transform_river_decision_tree_data(decision_tree, distribution=True, min_val
                 value = row['stats'][1]/(row['stats'][0]+row['stats'][1])
                 transformed_data[node_id] = {'value': value}
 
-    # Sort the dictionary by node IDs for consistent output
     transformed_data_sorted = dict(sorted(transformed_data.items()))
     return transformed_data_sorted
 

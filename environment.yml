@@ -6,9 +6,6 @@ dependencies:
   - python=3.10
   - pip:
     - graphviz==0.20.3
-    - log-distance-measures==2.0.0
-    - lxml==5.3.0
-    - matplotlib==3.6.2
     - numpy==1.26.4
     - pandas==2.2.3
     - pm4py==2.4.1

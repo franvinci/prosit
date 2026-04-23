@@ -15,6 +15,7 @@ def incremental_resource_weights_learning(
         label_data_attributes: list = [],
         label_data_attributes_categorical: list = [],
         values_categorical: dict = dict(),
+        use_workload_features: bool = False,
     ):
     """Return ``{resource: classifier}`` using incremental trees.
 
@@ -31,6 +32,7 @@ def incremental_resource_weights_learning(
         resources,
         max_concurrency,
         label_data_attributes,
+        use_workload_features=use_workload_features,
     )
 
     models = dict()

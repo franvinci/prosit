@@ -143,12 +143,17 @@ params.discover_from_eventlog(
     min_samples_leaf_cv: list = [50, 100, 200],
     multitasking_thr: float = 0.05,
     enable_multitasking: bool = False,
+    arrival_calendar_min_confidence: float = 0.1,
+    arrival_calendar_min_support: float = 0.7,
+    res_calendar_min_confidence: float = 0.1,
+    res_calendar_min_support: float = 0.1,
+    res_calendar_min_participation: float = 0.4,
     attribute_mode: str = 'distribution',
-    use_workload_features: bool = False,
     incremental_discovery: bool = False,
     grace_period: int = 1000,
     random_state: int = 72,
-    verbose: bool = True
+    verbose: bool = True,
+    use_workload_features: bool = False,
 )
 ```
 
@@ -161,12 +166,17 @@ Extracts all simulation parameters from the event log.
 | `min_samples_leaf_cv` | `list` | `[50,100,200]` | Candidate values for `min_samples_leaf` in cross-validation. Controls the minimum number of samples per leaf — critical for reliable per-leaf distribution fitting |
 | `multitasking_thr` | `float` | `0.05` | Minimum fraction of events with concurrent workload > 0 for a resource to be considered multitasking. Below this, capacity is set to 1 |
 | `enable_multitasking` | `bool` | `False` | If `True`, resources whose log exhibits concurrent workload above `multitasking_thr` get a capacity > 1 (parallel task execution). Default `False`: all resources capacity 1 |
+| `arrival_calendar_min_confidence` | `float` | `0.1` | Minimum per-slot confidence required to keep an (weekday, hour) slot in the arrival calendar |
+| `arrival_calendar_min_support` | `float` | `0.7` | Minimum fraction of arrivals that the accepted slots must cover; slots are greedily added until this is met |
+| `res_calendar_min_confidence` | `float` | `0.1` | Per-slot confidence threshold for each resource's calendar |
+| `res_calendar_min_support` | `float` | `0.1` | Minimum fraction of the resource's events that the accepted slots must cover |
+| `res_calendar_min_participation` | `float` | `0.4` | Minimum per-resource participation share; below it the resource falls back to a 24/7 calendar |
 | `attribute_mode` | `str` | `'distribution'` | How to model case-level data attributes. `'distribution'`: fits each attribute independently (categorical → frequency table, continuous → best-fitting scipy distribution). `'empirical'`: samples from the joint observed distribution (preserves correlations) |
-| `use_workload_features` | `bool` | `False` | If `True`, resource-selection and waiting-time models receive two extra features per candidate resource: current `workload` (concurrent tasks) and `queue_length` (tasks scheduled but not yet started) at the enabling time |
 | `incremental_discovery` | `bool` | `False` | Use Hoeffding Adaptive Trees instead of scikit-learn. Gives more weight to recent traces |
 | `grace_period` | `int` | `1000` | (Incremental only) Number of observations before the tree considers splitting a node |
 | `random_state` | `int` | `72` | Seed for all random operations (reproducibility) |
 | `verbose` | `bool` | `True` | Print discovery progress |
+| `use_workload_features` | `bool` | `False` | If `True`, resource-selection and waiting-time models receive two extra features per candidate resource: current `workload` (concurrent tasks) and `queue_length` (tasks scheduled but not yet started) at the enabling time |
 
 #### `to_json` / `from_json`
 
@@ -453,18 +463,20 @@ print(params.distribution_data_attributes)
 | Model | Tree type | Conditional on |
 |---|---|---|
 | Arrival time | Regressor | Hour of day, weekday |
-| Execution time | Regressor | Resource identity (one-hot), case attributes |
-| Waiting time | Regressor (per resource) | Activity being waited for (one-hot), case attributes; optionally `workload` and `queue_length` when `use_workload_features=True` |
+| Execution time | Regressor (per activity) | Resource identity (one-hot), hour, weekday, case attributes, activity history counts |
+| Waiting time | Regressor (per resource) | Activity being waited for (one-hot), hour, weekday, case attributes, activity history counts; optionally `workload` and `queue_length` when `use_workload_features=True` |
 | Control flow | Classifier (per transition) | Activity execution history (counts), case attributes |
-| Resource selection | Classifier (per resource) | Handover from previous resource (one-hot), activity being executed (one-hot), case attributes; optionally `workload` and `queue_length` when `use_workload_features=True` |
+| Resource selection | Classifier (per resource) | Per-resource history counts, activity being executed (one-hot), case attributes; optionally `workload` and `queue_length` when `use_workload_features=True` |
 
 History features are expressed as **raw counts** (number of times each activity has been executed in the case so far), so that decision tree rules are directly interpretable (e.g. `"Approve" <= 2` means "Approve has been executed at most 2 times").
 
 Before each classifier or regressor is fit, low-signal columns are pruned automatically: constant columns are dropped, and one-hot columns (resources, activities, categorical attribute values) with fewer than 20 positive observations in the current training slice are removed. This reduces noise from rare categories and keeps the CV grid compact.
 
+For the time-regression models, cross-validation selects between every `(max_depth, min_samples_leaf)` combination **and** a no-tree baseline (global empirical distribution). If no candidate tree beats the baseline on per-leaf Wasserstein distance, the model collapses to a single unconditional distribution.
+
 ### Distribution fitting
 
-For each leaf node of a regression tree, Prosit fits the best distribution among: `fixed`, `normal`, `exponential`, `lognormal`, `gamma`, `uniform`. The best fit is selected by minimising the deterministic Wasserstein distance between the empirical and theoretical quantiles. Outliers are removed using the Median Absolute Deviation method (threshold: 5 MAD) before fitting.
+For each leaf node of a regression tree, Prosit fits the best distribution among: `fixed`, `normal`, `exponential`, `lognormal`, `gamma`, `uniform`. The best fit is selected by minimising the deterministic Wasserstein distance between the empirical and theoretical quantiles. Outliers are removed using the Median Absolute Deviation method (threshold: 20 MAD) before fitting arrival and execution times. Waiting times are fitted on the raw leaf values (no outlier removal), because they are typically zero-inflated and heavy-tailed — filtering would distort both the zero mass and the long tail needed to reproduce real cycle times.
 
 ### Data attribute modeling
 

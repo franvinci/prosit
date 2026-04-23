@@ -1,15 +1,16 @@
+import warnings
 import pm4py
 import pandas as pd
 from pm4py.objects.log.obj import EventLog
-
 from tqdm import tqdm
 
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import GridSearchCV
 from sklearn.dummy import DummyClassifier
+from sklearn.exceptions import FitFailedWarning
 from sklearn.pipeline import Pipeline
 
-from prosit.utils.rule_utils import DecisionRules, apply_laplace_smoothing, BINARY_NEG_LOG_LOSS_SCORER, prune_low_signal_columns
+from prosit.utils.rule_utils import DecisionRules, BINARY_NEG_LOG_LOSS_SCORER, prune_low_signal_columns
 
 
 def discover_resources_list(log: EventLog) -> list:
@@ -58,23 +59,22 @@ def discover_weight_resources(
         resources: list,
         max_concurrency: dict,
         max_depths_cv: list = range(1,6),
-        min_samples_leaf_cv: list = [50, 100, 200],
         label_data_attributes: list = [],
         label_data_attributes_categorical: list = [],
         values_categorical: dict = dict(),
         random_state: int = 72,
         use_workload_features: bool = False
-    ) -> dict :
+    ) -> dict:
     """Return ``{resource: classifier}``.
 
     One binary classifier per resource, trained on events where the resource
     was a candidate (i.e. in the activity's role pool) AND was actually free
     at the enabling time (workload below its max concurrency). Features are
-    per-resource history counts, case attributes, and — when
-    ``use_workload_features`` is True — the resource's own workload and queue
-    length at enabling time. This matches the simulator's inference path:
-    the classifier is invoked only on free candidates, so training must
-    mirror that conditional distribution.
+    per-resource history counts (one column per resource), case attributes,
+    and — when ``use_workload_features`` is True — the resource's own
+    workload and queue length at enabling time. This matches the simulator's
+    inference path: the classifier is invoked only on free candidates, so
+    training must mirror that conditional distribution.
     """
 
     df_features = df_features[~df_features["resource"].isna()]
@@ -107,7 +107,6 @@ def discover_weight_resources(
         resources,
         max_concurrency,
         max_depths_cv,
-        min_samples_leaf_cv,
         label_data_attributes,
         label_data_attributes_categorical,
         values_categorical,
@@ -122,20 +121,17 @@ def build_models(
         resources: list,
         max_concurrency: dict,
         max_depths_cv: list = range(1,6),
-        min_samples_leaf_cv: list = [50, 100, 200],
         label_data_attributes: list = [],
         label_data_attributes_categorical: list = [],
         values_categorical: dict = dict(),
         random_state: int = 72,
         use_workload_features: bool = False
-    ) -> dict :
+    ) -> dict:
 
     param_grid = [
         {
             'clf': [DecisionTreeClassifier(random_state=random_state)],
             'clf__max_depth': list(max_depths_cv),
-            'clf__min_samples_leaf': list(min_samples_leaf_cv),
-            'clf__max_features': [None, 'sqrt'],
         },
         {'clf': [DummyClassifier(strategy='prior', random_state=random_state)]},
     ]
@@ -150,8 +146,9 @@ def build_models(
     )
 
     models = dict()
+    n_cv = 5
 
-    for r, data_r in tqdm(datasets.items()):
+    for r, data_r in tqdm(datasets.items(), desc='resource models'):
         if len(data_r['class'].unique()) < 2:
             # Constant label — store scalar probability (0 or 1).
             models[r] = float(data_r['class'].iloc[0]) if len(data_r) else 0.0
@@ -166,15 +163,33 @@ def build_models(
         X = prune_low_signal_columns(X)
         y = data_r['class']
 
+        if X.shape[1] == 0:
+            # No informative features survived pruning — fall back to the
+            # marginal probability (same semantics as the Dummy branch).
+            models[r] = float(y.mean())
+            continue
+
+        n_pos = int(y.sum())
+        n_neg = int(len(y) - n_pos)
+        if n_pos < n_cv or n_neg < n_cv:
+            # Too few samples in one class for 5-fold CV to produce both classes
+            # in every fold — the log-loss scorer errors. Fall back to the
+            # marginal.
+            models[r] = float(y.mean())
+            continue
+
         if max_depths_cv:
             pipe = Pipeline([('clf', DecisionTreeClassifier(random_state=random_state))])
             try:
-                grid_search = GridSearchCV(
-                    estimator=pipe,
-                    param_grid=param_grid,
-                    cv=3,
-                    scoring=BINARY_NEG_LOG_LOSS_SCORER,
-                ).fit(X, y)
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', FitFailedWarning)
+                    warnings.simplefilter('ignore', UserWarning)
+                    grid_search = GridSearchCV(
+                        estimator=pipe,
+                        param_grid=param_grid,
+                        cv=5,
+                        scoring=BINARY_NEG_LOG_LOSS_SCORER,
+                    ).fit(X, y)
                 best_clf = grid_search.best_estimator_.named_steps['clf']
             except Exception:
                 best_clf = DecisionTreeClassifier(max_depth=2, random_state=random_state).fit(X, y)
@@ -187,14 +202,8 @@ def build_models(
             clf_dtc = DecisionTreeClassifier(random_state=random_state, max_depth=1)
             clf_dtc.fit(X, y)
 
-        apply_laplace_smoothing(clf_dtc, alpha=1.0)
-
         clf = DecisionRules()
         clf.from_decision_tree(clf_dtc)
-
-        if clf is None:
-            clf = float(y.mode().iloc[0])
-
         models[r] = clf
 
     return models
@@ -223,14 +232,14 @@ def build_training_datasets(
     One training set per resource. Scope: events whose activity has the
     resource in its candidate pool AND where the resource was actually free
     (``workload < max_concurrency[r]``) at the enabling time. Features:
-    last-resource one-hot (handover), current-activity one-hot, and
-    enabled-time hour/weekday/month. When ``use_workload_features`` is True
-    the resource's own workload and queue length at enabling time are
-    appended. Target ``class`` is ``1`` when this resource actually
-    performed the event, ``0`` otherwise.
+    per-resource history counts (one column per resource), current-activity
+    one-hot, case attributes, and — when ``use_workload_features`` is True —
+    the resource's own workload and queue length at enabling time. Target
+    ``class`` is ``1`` when this resource actually performed the event,
+    ``0`` otherwise.
     """
 
-    handover_cols = ['handover_from_' + r for r in resources]
+    res_history_cols = list(resources)
     act_labels = list(act_to_resources.keys())
 
     r_to_acts = _resource_to_eligible_acts(act_to_resources, resources)
@@ -252,7 +261,7 @@ def build_training_datasets(
         workload_r = workload_r[free_mask]
         if df_scope.empty:
             continue
-        base = df_scope[handover_cols + list(label_data_attributes) + ["transition_label"]].reset_index(drop=True)
+        base = df_scope[res_history_cols + list(label_data_attributes) + ["transition_label"]].reset_index(drop=True)
         for a in act_labels:
             base['activity = ' + a] = (base['transition_label'] == a).astype(int)
         base = base.drop(columns=['transition_label'])

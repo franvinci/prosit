@@ -1,5 +1,9 @@
 from pm4py.objects.log.obj import EventLog
-from prosit.discovery.time_discovery import build_training_df_ex, build_training_df_arrival, build_training_df_wt
+from prosit.discovery.time_discovery import (
+    build_training_df_ex,
+    build_training_df_arrival,
+    build_training_df_wt,
+)
 from tqdm import tqdm
 import pandas as pd
 from river import tree
@@ -72,23 +76,25 @@ def incremental_execution_time_learning(
 
 def incremental_waiting_time_learning(
                                         df_features: pd.DataFrame,
-                                        net_transition_labels: list, 
+                                        net_transition_labels: list,
                                         resources: list,
-                                        calendars: dict, 
-                                        label_data_attributes: list, 
-                                        label_data_attributes_categorical: list, 
-                                        values_categorical: dict, 
+                                        calendars: dict,
+                                        label_data_attributes: list,
+                                        label_data_attributes_categorical: list,
+                                        values_categorical: dict,
                                         max_depth: int = 3,
-                                        grace_period: int = 1000
+                                        grace_period: int = 1000,
+                                        use_workload_features: bool = False,
                                     ) -> dict:
 
     df = build_training_df_wt(
                                 df_features,
                                 net_transition_labels,
-                                calendars, 
+                                calendars,
                                 label_data_attributes,
                                 label_data_attributes_categorical,
-                                values_categorical
+                                values_categorical,
+                                use_workload_features=use_workload_features,
                             )
 
     models_res = dict()

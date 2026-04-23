@@ -1,74 +1,44 @@
 import random
+import zlib
+import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from copy import copy
 
 import pm4py
 from tqdm import tqdm
+from joblib import Parallel
 from pm4py.algo.conformance.alignments.petri_net import algorithm as alignments
+from pm4py.algo.conformance.alignments.petri_net.algorithm import Parameters as AlignParams
 from pm4py.objects.petri_net.obj import PetriNet, Marking
-from pm4py.objects.log.obj import EventLog
-
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
 
 from prosit.utils.rule_utils import DecisionRules
 
-from river.tree.hoeffding_adaptive_tree_classifier import HoeffdingAdaptiveTreeClassifier
+
+# n_jobs=-2 is joblib for "all cores except one" — keeps the machine responsive
+# during long discovery runs. Workers must return (key, value) because
+# generator_unordered yields results in completion order, not submission order.
+DEFAULT_N_JOBS = -2
 
 
-
-def return_transitions_frequency(
-        log: EventLog, 
-        net: PetriNet, 
-        initial_marking: Marking, 
-        final_marking: Marking
-    ) -> dict:
-
-    try:
-        alignments_ = alignments.apply_multiprocessing(log, net, initial_marking, final_marking, parameters={"ret_tuple_as_trans_desc": True})
-    except Exception:
-        alignments_ = alignments.apply_log(log, net, initial_marking, final_marking, parameters={"ret_tuple_as_trans_desc": True})
-    aligned_traces = [[y[0] for y in x['alignment'] if y[0][1]!='>>'] for x in alignments_]
-
-    frequency_t = {t: 0 for t in net.transitions}
-    name_to_trans = {t.name: t for t in net.transitions}
-    for trace in aligned_traces:
-        for align in trace:
-            name_t = align[1]
-            if name_t in name_to_trans:
-                frequency_t[name_to_trans[name_t]] += 1
-
-    return frequency_t
+def parallel_with_progress(delayed_jobs, total, n_jobs=DEFAULT_N_JOBS, desc=None):
+    gen = Parallel(n_jobs=n_jobs, return_as='generator_unordered')(delayed_jobs)
+    return list(tqdm(gen, total=total, desc=desc))
 
 
-def return_enabled_and_fired_transitions(
-        net: PetriNet, 
-        initial_marking: Marking, 
-        final_marking: Marking, 
-        trace_aligned: list
-    ) -> tuple:
+def seed_worker_from_key(key, base_seed: int) -> None:
+    """Deterministic per-worker seed for Python ``random`` and numpy's global RNG.
 
-    visited_transitions = []
-    is_fired = []
-    tkns = list(initial_marking)
-    enabled_transitions = return_enabled_transitions(net, tkns)
-    name_to_trans = {t.name: t for t in net.transitions}
-    for t_fired_name in trace_aligned:
-        t_fired = name_to_trans[t_fired_name[1]]
-        not_fired_transitions = list(enabled_transitions-{t_fired})
-        for t_not_fired in not_fired_transitions:
-            visited_transitions.append(t_not_fired)
-            is_fired.append(0)
-        visited_transitions.append(t_fired)
-        is_fired.append(1)
-        tkns = update_current_marking(tkns, t_fired)
-        if set(tkns) == set(final_marking):
-            return visited_transitions, is_fired
-        enabled_transitions = return_enabled_transitions(net, tkns)
+    Parallel workers don't share RNG state with the parent, so code that
+    samples inside a worker (``sampling_from_dist``) is non-reproducible by
+    default. CRC32 of ``str(key)`` is stable across processes (unlike
+    Python's salted ``hash()``) so the per-entity seed is the same whether
+    the worker is dispatched in run A or run B.
+    """
+    s = (int(base_seed) + zlib.crc32(str(key).encode('utf-8'))) & 0xFFFFFFFF
+    random.seed(s)
+    np.random.seed(s)
 
-    return visited_transitions, is_fired
 
 
 def update_current_marking(m: Marking, t_fired: PetriNet.Transition) -> Marking:
@@ -97,36 +67,38 @@ def return_enabled_transitions(net: PetriNet, tkns: Marking) -> set:
 
 
 def return_fired_transition(transition_weights: dict, enabled_transitions: list) -> PetriNet.Transition:
-
-    total_weight = sum(transition_weights[s] for s in enabled_transitions)
+    # transition_weights is keyed by transition name (str); enabled_transitions
+    # are Transition objects from net.transitions. Keying by name avoids the
+    # id-based hash collisions that break object-keyed dicts after a joblib
+    # pickle round-trip in discovery workers.
+    total_weight = sum(transition_weights[s.name] for s in enabled_transitions)
     random_value = random.uniform(0, total_weight)
-    
+
     cumulative_weight = 0
     for s in enabled_transitions:
-        cumulative_weight += transition_weights[s]
+        cumulative_weight += transition_weights[s.name]
         if random_value <= cumulative_weight:
             return s
     return enabled_transitions[-1]
 
 
 def compute_transition_weights_from_model(models_t: dict, dict_x: dict, enabled_transitions=None) -> dict:
+    # models_t is keyed by transition name (str); enabled_transitions are
+    # Transition objects. Returned dict is also keyed by name, to feed
+    # return_fired_transition directly.
     transition_weights = dict()
-    keys = enabled_transitions if enabled_transitions is not None else models_t.keys()
-    for t in keys:
-        if type(models_t[t]) in [LogisticRegression, DecisionTreeClassifier, RandomForestClassifier]:
-            X = pd.DataFrame({k: [dict_x[k]] for k in dict_x.keys()})
-            transition_weights[t] = compute_proba(models_t, t, X)
-        elif type(models_t[t]) == HoeffdingAdaptiveTreeClassifier:
-            try:
-                transition_weights[t] = models_t[t].predict_proba_one(dict_x)[1]
-            except (KeyError, IndexError, Exception):
-                transition_weights[t] = 0
-        elif type(models_t[t]) == DecisionRules:
-            transition_weights[t] = models_t[t].apply(dict_x)
-        elif type(models_t[t]) == float:
-            transition_weights[t] = models_t[t]
+    if enabled_transitions is not None:
+        keys = [t.name for t in enabled_transitions]
+    else:
+        keys = list(models_t.keys())
+    for k in keys:
+        m = models_t.get(k)
+        if isinstance(m, DecisionRules):
+            transition_weights[k] = m.apply(dict_x)
+        elif isinstance(m, (int, float)):
+            transition_weights[k] = float(m)
         else:
-            transition_weights[t] = 1
+            transition_weights[k] = 0
     return transition_weights
 
 
@@ -155,20 +127,13 @@ def compute_resource_weights_from_model(models_r: dict, enabled_resources: list,
                 x_r['queue_length'] = queue_lengths.get(r, 0)
         else:
             x_r = dict_x
-        if type(model) == DecisionRules:
+        if isinstance(model, DecisionRules):
             resource_weights[r] = model.apply(x_r)
-        elif type(model) == float:
-            resource_weights[r] = model
+        elif isinstance(model, (int, float)):
+            resource_weights[r] = float(model)
         else:
             resource_weights[r] = 0
     return resource_weights
-
-
-def compute_proba(models_t: dict, t: PetriNet.Transition, X:pd.DataFrame) -> float:
-    
-    clf_t = models_t[t]
-    
-    return clf_t.predict_proba(X)[0,1]
 
 
 def count_concurrent_events(schedule, t_enabled) -> int:
@@ -192,32 +157,30 @@ def is_resource_busy(schedule, t_enabled) -> bool:
     return False
 
 
-def count_false_hours(calendar: dict, start_ts: datetime, end_ts: datetime) -> int:
-    false_hours_count = 0
-    current_time = start_ts
-    
-    while current_time < end_ts:
-        weekday = current_time.weekday()
-        hour = current_time.hour
-        
-        if not calendar.get(weekday, {}).get(hour, False):
-            false_hours_count += 1
-            
-        current_time += timedelta(hours=1)
-
-    return false_hours_count
-
-
 def calendar_to_working_set(calendar: dict) -> frozenset:
     return frozenset((wd, h) for wd, hours in calendar.items() for h, active in hours.items() if active)
 
 
 def count_working_minutes(start_ts: datetime, end_ts: datetime, calendar: dict, _working_set: frozenset = None) -> int:
+    # Same hour-by-hour loop pattern as add_minutes_with_calendar: O(wall time),
+    # which kills discovery on long training logs. Skip full weeks in one jump
+    # first (each contributes exactly ``minutes_per_week``, because shifting by
+    # 7 days preserves the (weekday, hour) pattern), then run the original
+    # loop on the <1 week residual.
     if end_ts <= start_ts:
         return 0
     working_set = _working_set if _working_set is not None else calendar_to_working_set(calendar)
+    minutes_per_week = len(working_set) * 60
+
     working_minutes = 0
     current_time = start_ts
+    if minutes_per_week > 0:
+        week_seconds = 7 * 24 * 3600
+        full_weeks = int((end_ts - current_time).total_seconds() // week_seconds)
+        if full_weeks > 0:
+            working_minutes += full_weeks * minutes_per_week
+            current_time = current_time + timedelta(weeks=full_weeks)
+
     while current_time < end_ts:
         weekday = current_time.weekday()
         hour = current_time.hour
@@ -231,21 +194,26 @@ def count_working_minutes(start_ts: datetime, end_ts: datetime, calendar: dict, 
     return round(working_minutes)
 
 
-def snap_to_next_working_slot(ts: datetime, calendar: dict, _working_set: frozenset = None) -> datetime:
-    """If ts falls outside a working hour, advance to the start of the next working hour."""
-    working_set = _working_set if _working_set is not None else calendar_to_working_set(calendar)
-    current = ts
-    for _ in range(7 * 24):  # max 1 week lookahead
-        if (current.weekday(), current.hour) in working_set:
-            return current
-        current = (current + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-    return ts  # calendar is empty or all-false, return as-is
-
-
 def add_minutes_with_calendar(start_ts: datetime, minutes_to_add: int, calendar: dict, _working_set: frozenset = None) -> datetime:
+    # The minute-by-minute loop below is O(minutes_to_add). For datasets like
+    # BPI2017 where sampled waiting/execution times reach tens of thousands
+    # of minutes, that turns a single simulation step into a 10–70 ms call,
+    # and a full simulation into hours. A full week always contributes the
+    # same number of working minutes, so jump full weeks first and only loop
+    # over at most ~1 week of wall time afterwards.
     working_set = _working_set if _working_set is not None else calendar_to_working_set(calendar)
+    minutes_per_week = len(working_set) * 60
+    if minutes_per_week == 0:
+        # Empty calendar used to spin forever in the loop below. Fail loudly
+        # instead — this only fires when calendar discovery produced a
+        # calendar with no active slots (previously a silent hang).
+        raise ValueError("Calendar has no working hours; cannot advance time.")
+
     remaining_minutes = minutes_to_add
     current_time = start_ts
+    if remaining_minutes >= minutes_per_week:
+        full_weeks, remaining_minutes = divmod(remaining_minutes, minutes_per_week)
+        current_time = current_time + timedelta(weeks=full_weeks)
 
     while remaining_minutes > 0:
         weekday = current_time.weekday()
@@ -262,19 +230,60 @@ def add_minutes_with_calendar(start_ts: datetime, minutes_to_add: int, calendar:
     return current_time
 
 
-def get_transition_from_name(t_fired_name: str, net: PetriNet) -> PetriNet.Transition:
-    for t in net.transitions:
-        if t.name == t_fired_name:
-            return t
-        
+def _alignments_to_moves(log, net, im, fm, name_to_trans):
+    """Run A* alignments and project each trace to a list of
+    ``(move_type, transition)`` tuples.
+
+    ``move_type`` ∈ {``'sync'``, ``'tau'``, ``'model_visible'``}. Log-moves are
+    dropped — they correspond to events the model could not consume and thus
+    produce no firing. The caller advances the log-event cursor only on
+    ``'sync'`` moves.
+
+    ``ret_tuple_as_trans_desc=True`` gives each step as
+    ``((trace_t_name, model_t_name), (trace_label, model_label))``, which is
+    the only way to tell a visible model move (trace side ``'>>'``, model
+    label set) from a sync (both sides set) and from a τ (trace side ``'>>'``,
+    model label ``None``).
+    """
+    params = {AlignParams.PARAM_ALIGNMENT_RESULT_IS_SYNC_PROD_AWARE: True}
+    try:
+        aligned = alignments.apply_multiprocessing(log, net, im, fm, parameters=params)
+    except Exception:
+        aligned = alignments.apply_log(log, net, im, fm, parameters=params)
+
+    per_trace = []
+    for trace_align in aligned:
+        moves = []
+        if not trace_align:
+            per_trace.append(moves)
+            continue
+        for step in trace_align.get("alignment", []):
+            (trace_t_name, model_t_name), (_trace_label, model_label) = step
+            if model_t_name == '>>':
+                # Log move: event dropped, no firing.
+                continue
+            t = name_to_trans.get(model_t_name)
+            if t is None:
+                continue
+            if trace_t_name == '>>':
+                moves.append(('tau' if model_label is None else 'model_visible', t))
+            else:
+                moves.append(('sync', t))
+        per_trace.append(moves)
+    return per_trace
+
 
 def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels, resources, label_data_attributes=[], firing_sequences=None):
 
-    import numpy as np
-
     df_log = pm4py.convert_to_dataframe(log)
-    df_log["start:timestamp"] = df_log["start:timestamp"].apply(lambda x: datetime.fromisoformat(str(x)[:-6]).timestamp())
-    df_log["time:timestamp"] = df_log["time:timestamp"].apply(lambda x: datetime.fromisoformat(str(x)[:-6]).timestamp())
+    # Wall-clock epoch: strip tz if present, then take ``.timestamp()``. Used
+    # only for relative comparisons within this function, so the choice of
+    # reference tz doesn't matter as long as it's consistent.
+    def _to_wall_epoch(x):
+        ts = x.tz_localize(None) if getattr(x, 'tzinfo', None) is not None else x
+        return ts.timestamp()
+    df_log["start:timestamp"] = df_log["start:timestamp"].apply(_to_wall_epoch)
+    df_log["time:timestamp"] = df_log["time:timestamp"].apply(_to_wall_epoch)
 
     # Pre-group events by resource for fast concurrent-event lookup (avoids full df scan per step)
     resource_events = {}
@@ -287,41 +296,39 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
 
     name_to_trans = {t.name: t for t in net.transitions}
 
+    # Build, per trace, the sequence of (move_type, transition) pairs to walk.
+    # ``move_type`` is one of:
+    #   * 'sync'          -> visible transition paired with the log event at
+    #                        the current cursor ``j``; produces a full training
+    #                        row (resource, start_t, end_t, ...).
+    #   * 'tau'           -> invisible model move; marking-only, no row data.
+    #   * 'model_visible' -> visible transition with no corresponding log
+    #                        event (alignment was forced to fire it to reach
+    #                        the final marking); marking-only. The row carries
+    #                        ``None`` for resource/start_t/end_t so time- and
+    #                        resource-discovery (which filter on those) skip
+    #                        it, while cf-discovery still sees a "this
+    #                        transition fired at this marking" sample.
+    #
+    # This is the pm4py-native equivalent of what token replay used to do
+    # here, minus the token injection: A* never corrupts the marking, so
+    # ``return_enabled_transitions`` downstream always gets a clean enabled
+    # set. Log-moves in the alignment drop events (no training row), which is
+    # the trade-off for a clean marking.
     if firing_sequences is not None:
-        # Fast path: the simulator already knows which transitions fired per
-        # case, so we can fabricate the same alignment structure pm4py would
-        # return and skip the (expensive) A* conformance check entirely.
-        aligned_traces = []
-        for trace in log:
-            cid = trace[0]["case:concept:name"]
-            seq = firing_sequences.get(cid, [])
-            alignment = []
-            for t_name in seq:
-                t = name_to_trans[t_name]
-                label = t.label
-                if label is None:
-                    # Silent transition → model move (log side is '>>').
-                    alignment.append(((t_name, t_name), ('>>', None)))
-                else:
-                    # Visible transition → sync move.
-                    alignment.append(((t_name, t_name), (label, label)))
-            aligned_traces.append({"alignment": alignment})
+        activated_per_trace = [
+            [('tau' if name_to_trans[t_name].label is None else 'sync',
+              name_to_trans[t_name])
+             for t_name in firing_sequences.get(trace[0]["case:concept:name"], [])]
+            for trace in log
+        ]
     else:
-        try:
-            aligned_traces = alignments.apply_multiprocessing(
-                log, net, im, fm,
-                parameters={"ret_tuple_as_trans_desc": True},
-            )
-        except Exception:
-            aligned_traces = alignments.apply_log(
-                log, net, im, fm,
-                parameters={"ret_tuple_as_trans_desc": True},
-            )
+        activated_per_trace = _alignments_to_moves(log, net, im, fm, name_to_trans)
 
     dataset = []
     for i, trace in enumerate(tqdm(log)):
 
-        trace_aligned = aligned_traces[i]["alignment"]
+        activated = activated_per_trace[i]
 
         case_id = trace[0]["case:concept:name"]
         history = {t_l: 0 for t_l in net_transition_labels}
@@ -340,13 +347,8 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
         j = 0
         transition_enabled_times = dict()
         current_t = trace[0]["start:timestamp"]
-        for step in trace_aligned:
-            if step[0][1] == ">>": # log move
-                continue
-
-            transition = name_to_trans[step[0][1]]
+        for move_type, transition in activated:
             transition_label = transition.label
-
 
             prev_enabled_transitions = return_enabled_transitions(net, marking)
 
@@ -354,19 +356,37 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
                 if enabled not in transition_enabled_times:
                     transition_enabled_times[enabled] = current_t
 
-            if step[1][0] == step[1][1]: # sync move
+            if move_type == 'sync':  # real log event paired with this firing
                 resource = trace[j]["org:resource"]
                 start_t = trace[j]["start:timestamp"]
                 end_t = trace[j]["time:timestamp"]
-                enabled_t = transition_enabled_times[transition]
+                # With A* the marking is always consistent, so the transition
+                # should be structurally enabled here and ``transition_enabled_times``
+                # should have its enable time. Fall back to ``current_t`` only as a
+                # defensive measure.
+                enabled_t = transition_enabled_times.get(transition, current_t)
                 current_t = end_t
-                enabled_ts = enabled_t.timestamp()
+                # Match the wall-clock epoch produced by ``_to_wall_epoch``
+                # above (pandas' ``.timestamp()`` after ``tz_localize(None)``
+                # interprets the naive wall clock as UTC). Force-tagging
+                # ``enabled_t`` as UTC gives the same semantics regardless of
+                # its original tz (or absence thereof).
+                enabled_ts = enabled_t.replace(tzinfo=timezone.utc).timestamp()
                 if resource in resource_events:
                     re = resource_events[resource]
                     concurrent = (re['start_ts'] < enabled_ts) & (re['end_ts'] > enabled_ts)
                     res_workload = int(concurrent.sum())
                     if res_workload > 0:
-                        resource_free_t = datetime.fromtimestamp(re['end_ts'][concurrent].max(), tz=timezone.utc)
+                        max_epoch = re['end_ts'][concurrent].max()
+                        # Reverse of ``_to_wall_epoch``: interpret the epoch
+                        # as UTC, strip the tzinfo to recover the original
+                        # wall clock, then re-attach ``enabled_t``'s tz so
+                        # subtraction with ``start_t`` stays tz-compatible.
+                        wall = datetime.fromtimestamp(max_epoch, tz=timezone.utc).replace(tzinfo=None)
+                        if enabled_t.tzinfo is not None:
+                            resource_free_t = wall.replace(tzinfo=enabled_t.tzinfo)
+                        else:
+                            resource_free_t = wall
                     else:
                         resource_free_t = enabled_t
                 else:
@@ -388,7 +408,7 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
                         candidate_workloads[cand] = 0
                 prev_enabled_resources = act_to_resources[transition_label]
                 j += 1
-            else: # model move
+            else:  # 'tau' or 'model_visible': marking update only, no log event
                 resource = None
                 enabled_t = None
                 start_t = None
@@ -398,15 +418,20 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
                 prev_enabled_resources = None
                 candidate_workloads = None
 
-            del transition_enabled_times[transition]
-            
+            transition_enabled_times.pop(transition, None)
+
             marking = update_current_marking(marking, transition)
 
             handover_features = tuple(1 if r == last_resource else 0 for r in resources)
             last_activity_features = tuple(1 if t_l == last_activity else 0 for t_l in net_transition_labels)
             dataset.append((case_id, transition, transition_label, resource, enabled_t, start_t, end_t, prev_enabled_transitions, prev_enabled_resources, res_workload, resource_free_t, candidate_workloads) + tuple(trace_attributes) + tuple(history_res.values()) + tuple(history.values()) + handover_features + last_activity_features)
 
-            if transition_label:
+            # Only update activity/resource history for real log events. A
+            # model_visible move is the aligner firing a visible transition
+            # with no corresponding event, so treating it as "activity done"
+            # would drift the history away from what the simulator sees at
+            # inference time (where every visible firing IS an event).
+            if move_type == 'sync' and transition_label:
                 history[transition_label] += 1
                 if resource in resources:
                     history_res[resource] += 1

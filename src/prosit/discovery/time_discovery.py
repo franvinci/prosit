@@ -1,5 +1,5 @@
 import numpy as np
-from tqdm import tqdm
+from joblib import Parallel, delayed
 import pandas as pd
 import pm4py
 
@@ -9,7 +9,13 @@ from scipy.stats import wasserstein_distance
 
 from pm4py.objects.log.obj import EventLog
 
-from prosit.utils.common_utils import count_working_minutes, calendar_to_working_set
+from prosit.utils.common_utils import (
+    count_working_minutes,
+    calendar_to_working_set,
+    parallel_with_progress,
+    seed_worker_from_key,
+    DEFAULT_N_JOBS,
+)
 from prosit.utils.distribution_utils import return_best_distribution, sampling_from_dist, remove_outliers
 from prosit.utils.rule_utils import DecisionRules, prune_low_signal_columns
 
@@ -81,7 +87,7 @@ def discover_waiting_time(
         max_depths: list = range(1,6),
         min_samples_leaf_cv: list = [50, 100, 200],
         random_state: int = 72,
-        use_workload_features: bool = False
+        use_workload_features: bool = False,
     ) -> dict:
 
     if not max_depths:
@@ -98,7 +104,7 @@ def discover_waiting_time(
                                                             max_depths,
                                                             min_samples_leaf_cv,
                                                             random_state=random_state,
-                                                            use_workload_features=use_workload_features
+                                                            use_workload_features=use_workload_features,
                                                         )
 
     return res_waiting_time_distributions
@@ -107,7 +113,7 @@ def discover_waiting_time(
 
 # BUILD ML MODELS
 
-def _wasserstein_cv_score_no_rule(y_arr, random_state, n_splits=3) -> float:
+def _wasserstein_cv_score_no_rule(y_arr, random_state, n_splits=5) -> float:
     # Baseline candidate for the CV: no tree at all, just the global empirical
     # distribution. Score = average per-fold Wasserstein(y_te, y_tr), aligned
     # with the tree scorer so the two are directly comparable.
@@ -127,33 +133,35 @@ def _wasserstein_cv_score_no_rule(y_arr, random_state, n_splits=3) -> float:
     return float(np.mean(fold_scores))
 
 
-def _build_no_rule_decision_rules(y, use_outlier_removal: bool = True) -> DecisionRules:
-    y_raw = y.values if hasattr(y, 'values') else np.asarray(y)
-    y_l = remove_outliers(pd.Series(y_raw)) if use_outlier_removal else y_raw
-    y_l = np.asarray(y_l)
-    clf = DecisionRules()
+def _fit_leaf_distribution(y_values, use_outlier_removal: bool) -> dict:
+    """Fit a single leaf's distribution and return a rule dict with
+    ``value``, ``dist``, ``sampled``."""
+
+    y_raw = np.asarray(y_values.values if hasattr(y_values, 'values') else y_values)
+    n_sample = max(len(y_raw), DEFAULT_SAMPLE_SIZE)
+
+    y_l = np.asarray(remove_outliers(pd.Series(y_raw))) if use_outlier_removal else y_raw
     if len(y_l) == 0:
-        clf.rules = {0: {'value': 0.0, 'sampled': [0], 'dist': ('fixed', (0,), 0, 0)}}
-        return clf
+        return {'value': 0.0, 'dist': ('fixed', (0,), 0, 0), 'sampled': [0]}
     min_value = float(np.min(y_l))
     max_value = float(np.max(y_l))
     mean_value = float(np.mean(y_l))
     dist, params = return_best_distribution(y_l, dist_search=DIST_SEARCH)
-    sampled = sampling_from_dist(
-        dist, params, min_value, max_value, mean_value,
-        n_sample=max(len(y_l), DEFAULT_SAMPLE_SIZE),
-    )
-    clf.rules = {
-        0: {
-            'value': mean_value,
+    sampled = list(sampling_from_dist(
+        dist, params, min_value, max_value, mean_value, n_sample=n_sample,
+    ))
+    return {'value': mean_value,
             'dist': (dist, params, min_value, max_value),
-            'sampled': list(sampled),
-        }
-    }
+            'sampled': sampled}
+
+
+def _build_no_rule_decision_rules(y, use_outlier_removal: bool = True) -> DecisionRules:
+    clf = DecisionRules()
+    clf.rules = {0: _fit_leaf_distribution(y, use_outlier_removal)}
     return clf
 
 
-def _wasserstein_cv_score(X_arr, y_arr, max_depth, min_samples_leaf, random_state, n_splits=3) -> float:
+def _wasserstein_cv_score(X_arr, y_arr, max_depth, min_samples_leaf, random_state, n_splits=5) -> float:
     # Per-leaf empirical Wasserstein averaged across folds, weighted by
     # held-out leaf size. Aligned with the ctd metric (Wasserstein on cycle
     # time) rather than R², and robust to the heavy-tailed y typical of
@@ -195,7 +203,7 @@ def _wasserstein_cv_score(X_arr, y_arr, max_depth, min_samples_leaf, random_stat
 def _fit_decision_rules(X, y, param_grid, max_depths, random_state, use_outlier_removal=True) -> DecisionRules:
     if len(X) == 0:
         clf = DecisionRules()
-        clf.rules = {0: {'value': 0.0, 'sampled': [0], 'dist': ('fixed', (0,))}}
+        clf.rules = {0: {'value': 0.0, 'sampled': [0], 'dist': ('fixed', (0,), 0, 0)}}
         return clf
 
     if isinstance(X, pd.DataFrame):
@@ -238,13 +246,10 @@ def _fit_decision_rules(X, y, param_grid, max_depths, random_state, use_outlier_
     clf.from_decision_tree(clf_mean)
 
     for l in y_leaf['Leaf'].unique():
-        y_l = remove_outliers(y_leaf[y_leaf['Leaf'] == l]['Y']) if use_outlier_removal else y_leaf[y_leaf['Leaf'] == l]['Y'].values
-        min_value = np.min(y_l)
-        max_value = np.max(y_l)
-        dist, params = return_best_distribution(y_l, dist_search=DIST_SEARCH)
-        sampled = sampling_from_dist(dist, params, min_value, max_value, clf.rules[l]['value'], n_sample=max(len(y_l), DEFAULT_SAMPLE_SIZE))
-        clf.rules[l]['dist'] = dist, params, min_value, max_value
-        clf.rules[l]['sampled'] = list(sampled)
+        y_l_raw = y_leaf[y_leaf['Leaf'] == l]['Y'].values
+        leaf_fit = _fit_leaf_distribution(y_l_raw, use_outlier_removal)
+        clf.rules[l]['dist'] = leaf_fit['dist']
+        clf.rules[l]['sampled'] = leaf_fit['sampled']
 
     return clf
 
@@ -257,12 +262,27 @@ def build_model_arrival(
         random_state: int = 72
     ) -> DecisionRules:
 
+    seed_worker_from_key('__arrival__', random_state)
     param_grid = {'max_depth': max_depths, 'min_samples_leaf': min_samples_leaf_cv}
     df = build_training_df_arrival(log, calendar_arrival)
     X = df.drop(columns=['arrival_time'])
     y = df['arrival_time']
-    return _fit_decision_rules(X, y, param_grid, max_depths, random_state, use_outlier_removal=False)
+    return _fit_decision_rules(X, y, param_grid, max_depths, random_state)
 
+
+
+def _fit_one_ex_worker(act, df_act, param_grid, max_depths, random_state):
+    seed_worker_from_key(act, random_state)
+    X = df_act.drop(columns=['execution_time'])
+    y = df_act['execution_time']
+    return act, _fit_decision_rules(X, y, param_grid, max_depths, random_state)
+
+
+def _fit_one_wt_worker(res, df_res, param_grid, max_depths, random_state):
+    seed_worker_from_key(res, random_state)
+    X = df_res.drop(columns=['waiting_time'])
+    y = df_res['waiting_time']
+    return res, _fit_decision_rules(X, y, param_grid, max_depths, random_state, use_outlier_removal=False)
 
 
 def build_models_ex(
@@ -289,15 +309,21 @@ def build_models_ex(
                             )
 
     param_grid = {'max_depth': max_depths, 'min_samples_leaf': min_samples_leaf_cv}
-    models_act = dict()
 
-    for act in tqdm(activity_labels):
-        df_act = df[df['activity_executed'] == act].iloc[:, 1:]
-        X = df_act.drop(columns=['execution_time'])
-        y = df_act['execution_time']
-        models_act[act] = _fit_decision_rules(X, y, param_grid, max_depths, random_state)
+    # Pre-slice once so each worker only receives its own activity's rows,
+    # not the full df.
+    df_by_act = {a: grp.iloc[:, 1:] for a, grp in df.groupby('activity_executed', sort=False)}
+    empty_slice = df.iloc[0:0, 1:]
 
-    return models_act
+    jobs = (
+        delayed(_fit_one_ex_worker)(
+            act, df_by_act.get(act, empty_slice),
+            param_grid, max_depths, random_state,
+        )
+        for act in activity_labels
+    )
+    results = parallel_with_progress(jobs, total=len(activity_labels), desc='exec-time models')
+    return dict(results)
 
 
 
@@ -312,7 +338,7 @@ def build_models_wt(
         max_depths: list = range(1,6),
         min_samples_leaf_cv: list = [50, 100, 200],
         random_state: int = 72,
-        use_workload_features: bool = False
+        use_workload_features: bool = False,
     ) -> dict:
 
     df = build_training_df_wt(
@@ -326,15 +352,19 @@ def build_models_wt(
                             )
 
     param_grid = {'max_depth': max_depths, 'min_samples_leaf': min_samples_leaf_cv}
-    models_res = dict()
 
-    for res in tqdm(resources):
-        df_res = df[df['resource'] == res].iloc[:, 1:]
-        X = df_res.drop(columns=['waiting_time'])
-        y = df_res['waiting_time']
-        models_res[res] = _fit_decision_rules(X, y, param_grid, max_depths, random_state, use_outlier_removal=False)
+    df_by_res = {r: grp.iloc[:, 1:] for r, grp in df.groupby('resource', sort=False)}
+    empty_slice = df.iloc[0:0, 1:]
 
-    return models_res
+    jobs = (
+        delayed(_fit_one_wt_worker)(
+            res, df_by_res.get(res, empty_slice),
+            param_grid, max_depths, random_state,
+        )
+        for res in resources
+    )
+    results = parallel_with_progress(jobs, total=len(resources), desc='waiting-time models')
+    return dict(results)
 
 
 
@@ -364,6 +394,36 @@ def build_training_df_arrival(
 
 
 
+def _exec_time_chunk(chunk, calendars, working_sets):
+    return chunk.apply(
+        lambda x: count_working_minutes(x["start_t"], x["end_t"], calendars[x["resource"]], working_sets[x["resource"]]),
+        axis=1,
+    )
+
+
+def _waiting_time_chunk(chunk, calendars, working_sets):
+    return chunk.apply(
+        lambda x: count_working_minutes(x["resource_free_t"], x["start_t"], calendars[x["resource"]], working_sets[x["resource"]]),
+        axis=1,
+    )
+
+
+def _parallel_working_minutes(df, calendars, working_sets, chunk_fn):
+    # count_working_minutes iterates hour-by-hour in pure Python, so a
+    # 100k-row df.apply can take minutes. Split into n_chunks so each worker
+    # does ~O(rows/n_chunks) Python iterations. Only ship the three columns
+    # the lambda actually needs to keep per-worker pickle cost bounded.
+    import os
+    n_chunks = max(1, (os.cpu_count() or 2) - 1)
+    if len(df) == 0 or n_chunks == 1:
+        return chunk_fn(df, calendars, working_sets)
+    chunks = np.array_split(df, n_chunks)
+    results = Parallel(n_jobs=DEFAULT_N_JOBS)(
+        delayed(chunk_fn)(c, calendars, working_sets) for c in chunks
+    )
+    return pd.concat(results)
+
+
 def build_training_df_ex(
         df_features: pd.DataFrame,
         resources: list,
@@ -374,10 +434,14 @@ def build_training_df_ex(
         values_categorical: dict
     ) -> pd.DataFrame:
 
-    df_et = df_features[["transition_label", "resource", "start_t", "end_t"] + label_data_attributes]
+    df_et = df_features[["transition_label", "resource", "start_t", "end_t"] + label_data_attributes + list(activity_labels)]
     df_et = df_et[~df_et["start_t"].isna()]
     working_sets_ex = {r: calendar_to_working_set(calendars[r]) for r in calendars}
-    df_et["execution_time"] = df_et.apply(lambda x: count_working_minutes(x["start_t"], x["end_t"], calendars[x["resource"]], working_sets_ex[x["resource"]]), axis=1)
+    df_et["execution_time"] = _parallel_working_minutes(
+        df_et[["start_t", "end_t", "resource"]], calendars, working_sets_ex, _exec_time_chunk,
+    )
+    df_et["hour"] = df_et["start_t"].apply(lambda ts: ts.hour)
+    df_et["weekday"] = df_et["start_t"].apply(lambda ts: ts.weekday())
     df_et.drop(columns=["start_t", "end_t"], inplace=True)
     df_et.rename(columns={"transition_label": "activity_executed"}, inplace=True)
     df_et.reset_index(drop=True, inplace=True)
@@ -403,15 +467,19 @@ def build_training_df_wt(
         label_data_attributes_categorical: list,
         values_categorical: dict,
         use_workload_features: bool = False
-    ) -> dict:
+    ) -> pd.DataFrame:
 
-    base_cols = ["resource", "transition_label", "start_t", "resource_free_t"] + list(label_data_attributes)
+    base_cols = ["resource", "transition_label", "start_t", "resource_free_t"] + list(label_data_attributes) + list(net_transition_labels)
     if use_workload_features:
         base_cols = base_cols + ["res_workload", "queue_length"]
     df_wt = df_features[base_cols]
     df_wt = df_wt[~df_wt["start_t"].isna()]
     working_sets_wt = {r: calendar_to_working_set(calendars[r]) for r in calendars}
-    df_wt["waiting_time"] = df_wt.apply(lambda x: count_working_minutes(x["resource_free_t"], x["start_t"], calendars[x["resource"]], working_sets_wt[x["resource"]]), axis=1)
+    df_wt["waiting_time"] = _parallel_working_minutes(
+        df_wt[["start_t", "resource_free_t", "resource"]], calendars, working_sets_wt, _waiting_time_chunk,
+    )
+    df_wt["hour"] = df_wt["resource_free_t"].apply(lambda ts: ts.hour)
+    df_wt["weekday"] = df_wt["resource_free_t"].apply(lambda ts: ts.weekday())
     df_wt.drop(columns=["start_t", "resource_free_t"], inplace=True)
     if use_workload_features:
         df_wt.rename(columns={"res_workload": "workload"}, inplace=True)
@@ -452,7 +520,17 @@ def find_best_distribution_arrival(log: EventLog,
     return dist, params, min_value, max_value, np.mean(arrival_times)
 
 
-def find_best_distribution_ex(df_features: pd.DataFrame, 
+def _fit_best_distribution_worker(key, times, use_outlier_removal: bool = True):
+    if use_outlier_removal:
+        times = remove_outliers(times)
+    if len(times) == 0:
+        return key, ('fixed', (0,), 0, 0, 0)
+
+    dist, params = return_best_distribution(times, dist_search=DIST_SEARCH)
+    return key, (dist, params, np.min(times), np.max(times), np.mean(times))
+
+
+def find_best_distribution_ex(df_features: pd.DataFrame,
         activity_labels: list,
         calendars: dict
     ) -> dict:
@@ -460,63 +538,44 @@ def find_best_distribution_ex(df_features: pd.DataFrame,
     df_et = df_features[["transition_label", "resource", "start_t", "end_t"]]
     df_et = df_et[~df_et["start_t"].isna()]
     working_sets_ex2 = {r: calendar_to_working_set(calendars[r]) for r in calendars}
-    df_et["execution_time"] = df_et.apply(lambda x: count_working_minutes(x["start_t"], x["end_t"], calendars[x["resource"]], working_sets_ex2[x["resource"]]), axis=1)
+    df_et["execution_time"] = _parallel_working_minutes(
+        df_et[["start_t", "end_t", "resource"]], calendars, working_sets_ex2, _exec_time_chunk,
+    )
 
-    activity_exec_time_distributions = dict()
-
-    for act in activity_labels:
-        df_act = df_et[df_et['transition_label'] == act]
-
-        exec_times = df_act['execution_time'].dropna().tolist()
-        exec_times = remove_outliers(exec_times)
-
-        if len(exec_times) == 0:
-            dist = 'fixed'
-            params = (0,)
-            max_value = 0
-            min_value = 0
-            mean_value = 0
-        else:
-            dist, params = return_best_distribution(exec_times, dist_search=DIST_SEARCH)
-            min_value = np.min(exec_times)
-            max_value = np.max(exec_times)
-            mean_value = np.mean(exec_times)
-
-        activity_exec_time_distributions[act] = (dist, params, min_value, max_value, mean_value)
-
-    return activity_exec_time_distributions
+    times_by_act = {
+        act: grp['execution_time'].dropna().tolist()
+        for act, grp in df_et.groupby('transition_label', sort=False)
+    }
+    jobs = (
+        delayed(_fit_best_distribution_worker)(act, times_by_act.get(act, []))
+        for act in activity_labels
+    )
+    results = parallel_with_progress(jobs, total=len(activity_labels), desc='exec-time distributions')
+    return dict(results)
 
 
 def find_best_distribution_wt(df_features: pd.DataFrame,
         resources: list,
-        calendars: dict
+        calendars: dict,
     ) -> dict:
+    """Discover one global waiting-time distribution per resource (no-rules
+    mode). Returns ``(dist, params, min, max, mean)`` per resource."""
 
     df_wt = df_features[["resource", "start_t", "resource_free_t"]]
     df_wt = df_wt[~df_wt["start_t"].isna()]
     working_sets_wt2 = {r: calendar_to_working_set(calendars[r]) for r in calendars}
-    df_wt["waiting_time"] = df_wt.apply(lambda x: count_working_minutes(x["resource_free_t"], x["start_t"], calendars[x["resource"]], working_sets_wt2[x["resource"]]), axis=1)
+    df_wt["waiting_time"] = _parallel_working_minutes(
+        df_wt[["start_t", "resource_free_t", "resource"]], calendars, working_sets_wt2, _waiting_time_chunk,
+    )
     df_wt.reset_index(drop=True, inplace=True)
 
-    res_waiting_time_distributions = dict()
-
-    for res in resources:
-        df_res = df_wt[df_wt['resource'] == res]
-        waiting_times = df_res['waiting_time'].dropna().tolist()
-        waiting_times = remove_outliers(waiting_times)
-
-        if len(waiting_times) == 0:
-            dist = 'fixed'
-            params = (0,)
-            min_value = 0
-            max_value = 0
-            mean_value = 0
-        else:
-            dist, params = return_best_distribution(waiting_times, dist_search=DIST_SEARCH)
-            min_value = np.min(waiting_times)
-            max_value = np.max(waiting_times)
-            mean_value = np.mean(waiting_times)
-
-        res_waiting_time_distributions[res] = (dist, params, min_value, max_value, mean_value)
-
-    return res_waiting_time_distributions
+    times_by_res = {
+        res: grp['waiting_time'].dropna().tolist()
+        for res, grp in df_wt.groupby('resource', sort=False)
+    }
+    jobs = (
+        delayed(_fit_best_distribution_worker)(res, times_by_res.get(res, []), use_outlier_removal=False)
+        for res in resources
+    )
+    results = parallel_with_progress(jobs, total=len(resources), desc='waiting-time distributions')
+    return dict(results)

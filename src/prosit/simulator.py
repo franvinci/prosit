@@ -1,8 +1,7 @@
 import random
 import pandas as pd
-import math
 import heapq
-from datetime import datetime
+from datetime import datetime, timedelta
 from tqdm import tqdm
 
 import pm4py
@@ -30,7 +29,7 @@ from prosit.utils.common_utils import (
     compute_resource_weights_from_model,
     )
 from prosit.utils.distribution_utils import sampling_from_dist
-from prosit.utils.save_and_load_utils import decision_rules_to_dict, transition_to_name, convert_calendar_names, dict_to_decrules, name_to_transition, fromstr_to_scipy
+from prosit.utils.save_and_load_utils import decision_rules_to_dict, convert_calendar_names, dict_to_decrules, fromstr_to_scipy
 
 import json
 
@@ -48,7 +47,7 @@ class SimulatorParameters:
             initial_marking: Marking,
             final_marking: Marking
         ):
-        """ Initilize parameters """
+        """ Initialize parameters """
         
         self.net: PetriNet = net
         self.initial_marking: Marking = initial_marking
@@ -59,7 +58,7 @@ class SimulatorParameters:
         self.label_data_attributes_categorical: list = []
         self.attribute_values_label_categorical: dict = dict()
 
-        self.transition_weights: dict = {t: 1 for t in list(self.net.transitions)}
+        self.transition_weights: dict = {t.name: 1 for t in list(self.net.transitions)}
         self.resources: list = ['auto']
         self.act_to_resources: dict = {act: [r for r in self.resources] for act in self.net_transition_labels}
         self.resource_weights: dict = {"auto": 1}
@@ -82,14 +81,17 @@ class SimulatorParameters:
             min_samples_leaf_cv: list = [50, 100, 200],
             multitasking_thr: float = 0.05,
             enable_multitasking: bool = False,
-            arrival_calendar_min_participation: float = 0.05,
-            res_calendar_min_participation: float = 0.05,
+            arrival_calendar_min_confidence: float = 0.1,
+            arrival_calendar_min_support: float = 0.7,
+            res_calendar_min_confidence: float = 0.1,
+            res_calendar_min_support: float = 0.1,
+            res_calendar_min_participation: float = 0.4,
             attribute_mode: str = 'distribution',
             incremental_discovery: bool = False,
             grace_period: int = 1000,
             random_state: int = 72,
             verbose: bool = True,
-            use_workload_features: bool = False
+            use_workload_features: bool = False,
         ):
         """ Discovery Parameters from event log data """
 
@@ -152,15 +154,14 @@ class SimulatorParameters:
                                                                     df_features,
                                                                     self.net_transition_labels,
                                                                     max_depths_cv=max_depth_cv,
-                                                                    min_samples_leaf_cv=min_samples_leaf_cv,
                                                                     label_data_attributes=self.label_data_attributes,
                                                                     label_data_attributes_categorical=self.label_data_attributes_categorical,
                                                                     values_categorical=self.attribute_values_label_categorical,
                                                                     random_state=random_state
                                                                 )
         for t in self.net.transitions:
-            if t not in self.transition_weights.keys():
-                self.transition_weights[t] = 0
+            if t.name not in self.transition_weights:
+                self.transition_weights[t.name] = 0
 
         if verbose:
             if incremental_discovery:
@@ -179,7 +180,8 @@ class SimulatorParameters:
                                                                             grace_period,
                                                                             self.label_data_attributes,
                                                                             self.label_data_attributes_categorical,
-                                                                            self.attribute_values_label_categorical
+                                                                            self.attribute_values_label_categorical,
+                                                                            use_workload_features=use_workload_features,
                                                                         )
         else:
             self.resource_weights = discover_weight_resources(
@@ -188,7 +190,6 @@ class SimulatorParameters:
                                                                 self.resources,
                                                                 self.max_concurrency,
                                                                 max_depth_cv,
-                                                                min_samples_leaf_cv,
                                                                 self.label_data_attributes,
                                                                 self.label_data_attributes_categorical,
                                                                 self.attribute_values_label_categorical,
@@ -198,8 +199,17 @@ class SimulatorParameters:
 
         if verbose:
             print("Calendars discovery...")
-        self.calendars = discover_res_calendars(log, self.resources, min_participation=res_calendar_min_participation)
-        self.arrival_calendar = discover_arrival_calendar(log, min_participation=arrival_calendar_min_participation)
+        self.calendars = discover_res_calendars(
+            log, self.resources,
+            min_confidence=res_calendar_min_confidence,
+            min_support=res_calendar_min_support,
+            min_participation=res_calendar_min_participation,
+        )
+        self.arrival_calendar = discover_arrival_calendar(
+            log,
+            min_confidence=arrival_calendar_min_confidence,
+            min_support=arrival_calendar_min_support,
+        )
 
         if verbose:
             if incremental_discovery:
@@ -242,13 +252,14 @@ class SimulatorParameters:
             self.waiting_time_distributions = incremental_waiting_time_learning(
                                                                                     df_features,
                                                                                     self.net_transition_labels,
-                                                                                    self.resources, 
-                                                                                    self.calendars, 
-                                                                                    self.label_data_attributes, 
-                                                                                    self.label_data_attributes_categorical, 
-                                                                                    self.attribute_values_label_categorical, 
+                                                                                    self.resources,
+                                                                                    self.calendars,
+                                                                                    self.label_data_attributes,
+                                                                                    self.label_data_attributes_categorical,
+                                                                                    self.attribute_values_label_categorical,
                                                                                     max_depth=max_depth_tree,
-                                                                                    grace_period=grace_period
+                                                                                    grace_period=grace_period,
+                                                                                    use_workload_features=use_workload_features,
                                                                                 )
         else:
             self.waiting_time_distributions = discover_waiting_time(
@@ -262,7 +273,7 @@ class SimulatorParameters:
                                                                         max_depths=max_depth_cv,
                                                                         min_samples_leaf_cv=min_samples_leaf_cv,
                                                                         random_state=random_state,
-                                                                        use_workload_features=use_workload_features
+                                                                        use_workload_features=use_workload_features,
                                                                     )
         
         if verbose:
@@ -288,7 +299,7 @@ class SimulatorParameters:
         else:
             return {'mode': mode, 'data': data}
 
-    def to_dict(self) ->  dict:
+    def to_dict(self) -> dict:
 
         dict_params = {
 
@@ -296,7 +307,7 @@ class SimulatorParameters:
             "use_workload_features": self.use_workload_features,
 
             "transition_params": {
-                "transition_weights": {transition_to_name(t): decision_rules_to_dict(dr) for t, dr in self.transition_weights.items()} # ok
+                "transition_weights": {t_name: decision_rules_to_dict(dr) for t_name, dr in self.transition_weights.items()}
                 },
 
             "resource_params": {
@@ -391,12 +402,12 @@ class SimulatorParameters:
         self.arrival_calendar = convert_calendar_names(dict_params["arrival_params"]["arrival_calendar"], to_number=True)
 
         if self.rules_mode:
-            self.transition_weights = {name_to_transition(t_name, self.net): dict_to_decrules(value) for t_name, value in dict_params["transition_params"]["transition_weights"].items()}
+            self.transition_weights = {t_name: dict_to_decrules(value) for t_name, value in dict_params["transition_params"]["transition_weights"].items()}
             self.execution_time_distributions = {act: dict_to_decrules(value) for act, value in dict_params["execution_time_params"]["execution_time_distributions"].items()}
             self.waiting_time_distributions = {res: dict_to_decrules(value) for res, value in dict_params["waiting_time_params"]["waiting_time_distributions"].items()}
             self.arrival_time_distribution = dict_to_decrules(dict_params["arrival_params"]["arrival_time_distributions"])
         else:
-            self.transition_weights = {name_to_transition(t_name, self.net): value for t_name, value in dict_params["transition_params"]["transition_weights"].items()}  
+            self.transition_weights = {t_name: value for t_name, value in dict_params["transition_params"]["transition_weights"].items()}
             self.execution_time_distributions = {act: (fromstr_to_scipy(value["dist_name"]), tuple(value["params"]), value["min_value"], value["max_value"], value["mean_value"]) for act, value in dict_params["execution_time_params"]["execution_time_distributions"].items()}
             self.waiting_time_distributions = {res: (fromstr_to_scipy(value["dist_name"]), tuple(value["params"]), value["min_value"], value["max_value"], value["mean_value"]) for res, value in dict_params["waiting_time_params"]["waiting_time_distributions"].items()}
             self.arrival_time_distribution = (fromstr_to_scipy(dict_params["arrival_params"]["arrival_time_distributions"]["dist_name"]), tuple(dict_params["arrival_params"]["arrival_time_distributions"]["params"]), dict_params["arrival_params"]["arrival_time_distributions"]["min_value"], dict_params["arrival_params"]["arrival_time_distributions"]["max_value"], dict_params["arrival_params"]["arrival_time_distributions"]["mean_value"])
@@ -485,9 +496,6 @@ class SimulatorEngine:
                             trace_attributes[a+' = '+str(v)] = int(x_attr_list[i][j] == v)
                     else:
                         trace_attributes[a] = x_attr_list[i][j]
-                
-            else:
-                trace_attributes = dict()
 
             if i > 0:
                 if not self.simulation_parameters.rules_mode:
@@ -504,9 +512,18 @@ class SimulatorEngine:
                         arrival_delta = self.simulation_parameters.arrival_time_distribution.apply(arrival_features)
                     else:
                         arrival_delta = self.simulation_parameters.arrival_time_distribution.apply_distribution(arrival_features)
-                if arrival_delta == 0:
-                    arrival_delta = 1
-                current_arr_ts = add_minutes_with_calendar(current_arr_ts, round(arrival_delta), self.simulation_parameters.arrival_calendar)
+                # Advance whole active minutes via the calendar, then add the
+                # residual seconds so sub-minute inter-arrivals (bursts) survive
+                # the fit→simulate round-trip. Floor to 1 second so two
+                # consecutive cases never share a timestamp.
+                arrival_delta_sec = max(1, round(arrival_delta * 60))
+                whole_min, frac_sec = divmod(arrival_delta_sec, 60)
+                if whole_min > 0:
+                    current_arr_ts = add_minutes_with_calendar(
+                        current_arr_ts, whole_min, self.simulation_parameters.arrival_calendar,
+                    )
+                if frac_sec > 0:
+                    current_arr_ts = current_arr_ts + timedelta(seconds=frac_sec)
 
             case = {
                 "case_id": i,
@@ -538,7 +555,6 @@ class SimulatorEngine:
 
         _zero_waiting_act = {'waiting_activity = ' + act_label: 0 for act_label in self.simulation_parameters.net_transition_labels}
         _zero_resource_onehot = {'resource = ' + res: 0 for res in self.simulation_parameters.resources}
-        _zero_handover = {'handover_from_' + res: 0 for res in self.simulation_parameters.resources}
         _zero_activity_onehot = {'activity = ' + act_label: 0 for act_label in self.simulation_parameters.net_transition_labels}
 
         completed_cases = set()
@@ -589,12 +605,9 @@ class SimulatorEngine:
                     if not self.simulation_parameters.rules_mode:
                         resource_weights = {r: self.simulation_parameters.resource_weights.get(r, 0.0) for r in enabled_resources}
                     else:
-                        handover_features = _zero_handover.copy()
-                        if case["last_resource"] is not None:
-                            handover_features['handover_from_' + case["last_resource"]] = 1
                         activity_onehot = _zero_activity_onehot.copy()
                         activity_onehot['activity = ' + activity] = 1
-                        res_features = handover_features | activity_onehot | case["attributes"]
+                        res_features = dict(case["res_history"]) | activity_onehot | case["attributes"]
                         if uwf:
                             resource_weights = compute_resource_weights_from_model(
                                 self.simulation_parameters.resource_weights,
@@ -613,7 +626,7 @@ class SimulatorEngine:
                     t_enabled_waited = t_enabled
                 if uwf:
                     r_workload = workloads[resource]
-                    r_queue_length = sum(1 for s, e in resource_schedule[resource] if s > t_enabled)
+                    r_queue_length = queue_lengths_cand[resource]
                 case["res_history"][resource] += 1
 
                 if sum(case["history"].values()) == 0:
@@ -629,10 +642,11 @@ class SimulatorEngine:
                     else:
                         waiting_activity_features = _zero_waiting_act.copy()
                         waiting_activity_features['waiting_activity = ' + activity] = 1
+                        time_features = {'hour': t_enabled_waited.hour, 'weekday': t_enabled_waited.weekday()}
                         if uwf:
-                            wt_features = {'workload': r_workload, 'queue_length': r_queue_length} | waiting_activity_features | case["attributes"]
+                            wt_features = {'workload': r_workload, 'queue_length': r_queue_length} | time_features | waiting_activity_features | case["attributes"] | case["history"]
                         else:
-                            wt_features = waiting_activity_features | case["attributes"]
+                            wt_features = time_features | waiting_activity_features | case["attributes"] | case["history"]
                         if deterministic_time:
                             waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply(wt_features)
                             if not isinstance(waiting_time, (int, float)):
@@ -652,15 +666,17 @@ class SimulatorEngine:
                 else:
                     resource_onehot = _zero_resource_onehot.copy()
                     resource_onehot['resource = ' + resource] = 1
+                    ex_time_features = {'hour': t_start_exec.hour, 'weekday': t_start_exec.weekday()}
+                    ex_features = resource_onehot | ex_time_features | case["attributes"] | case["history"]
                     if deterministic_time:
-                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply(resource_onehot | case["attributes"])
+                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply(ex_features)
                         if not isinstance(ex_time, (int, float)):
                             ex_time = 0
                     else:
-                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply_distribution(resource_onehot | case["attributes"])
+                        ex_time = self.simulation_parameters.execution_time_distributions[activity].apply_distribution(ex_features)
 
                 
-                t_end = add_minutes_with_calendar(t_start_exec, round(ex_time), self.simulation_parameters.calendars[resource])
+                t_end = add_minutes_with_calendar(t_start_exec, round(max(0, ex_time)), self.simulation_parameters.calendars[resource])
 
                 event_log.append((case_id, activity, resource, t_enabled, t_start_exec, t_end) + tuple(x_attr_list[case_id]))
                 resource_schedule[resource].append((t_start_exec, t_end))

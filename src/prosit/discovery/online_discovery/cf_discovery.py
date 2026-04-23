@@ -25,8 +25,8 @@ def incremental_transition_weights_learning(
 
     for t in tqdm(datasets_t.keys()):
         data_t = datasets_t[t]
-        if len(data_t['class'].unique())<2:
-            models_t[t] = None
+        if len(data_t['class'].unique()) < 2:
+            models_t[t] = float(data_t['class'].iloc[0]) if len(data_t) else 0.0
             continue
         
         for a in label_data_attributes_categorical:
