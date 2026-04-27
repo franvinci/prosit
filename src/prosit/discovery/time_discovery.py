@@ -275,7 +275,7 @@ def _fit_one_ex_worker(act, df_act, param_grid, max_depths, random_state):
     seed_worker_from_key(act, random_state)
     X = df_act.drop(columns=['execution_time'])
     y = df_act['execution_time']
-    return act, _fit_decision_rules(X, y, param_grid, max_depths, random_state)
+    return act, _fit_decision_rules(X, y, param_grid, max_depths, random_state, use_outlier_removal=False)
 
 
 def _fit_one_wt_worker(res, df_res, param_grid, max_depths, random_state):
@@ -547,7 +547,7 @@ def find_best_distribution_ex(df_features: pd.DataFrame,
         for act, grp in df_et.groupby('transition_label', sort=False)
     }
     jobs = (
-        delayed(_fit_best_distribution_worker)(act, times_by_act.get(act, []))
+        delayed(_fit_best_distribution_worker)(act, times_by_act.get(act, []), use_outlier_removal=False)
         for act in activity_labels
     )
     results = parallel_with_progress(jobs, total=len(activity_labels), desc='exec-time distributions')
