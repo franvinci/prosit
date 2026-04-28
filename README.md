@@ -18,6 +18,7 @@ Unlike basic simulation tools, Prosit builds **conditional models** — decision
 - [Simulation Options](#simulation-options)
 - [Save and Load Parameters](#save-and-load-parameters)
 - [Advanced Usage](#advanced-usage)
+- [Citation](#citation)
 
 ---
 
@@ -484,3 +485,27 @@ Case-level data attributes (e.g. `case:type`, `case:priority`) are discovered au
 
 - **`'distribution'`** (default): fits each attribute independently (categorical → frequency table, continuous → best-fitting scipy distribution). Useful when the log is small or attributes are largely independent.
 - **`'empirical'`**: samples complete attribute tuples from the observed joint distribution — preserves correlations between attributes.
+
+---
+
+## Citation
+
+Version [v0.1.0](https://github.com/franvinci/prosit/releases/tag/v0.1.0) of Prosit corresponds to the implementation presented in the following paper. Please cite it if you use Prosit in academic work:
+
+> Vinci, F., Park, G., van der Aalst, W.M.P., de Leoni, M. (2026). Reliable and Configurable Process Simulations via Probabilistic White-Box Models. In: Aiello, M., Deng, S., Murillo, JM., Georgievski, I., Benatallah, B., Wang, Z. (eds) Service-Oriented Computing. ICSOC 2025. Lecture Notes in Computer Science, vol 16321. Springer, Singapore. https://doi.org/10.1007/978-981-95-5015-9_24
+
+BibTeX:
+
+```bibtex
+@inproceedings{vinci2026prosit,
+  author    = {Vinci, Francesco and Park, Gyunam and van der Aalst, Wil M. P. and de Leoni, Massimiliano},
+  title     = {Reliable and Configurable Process Simulations via Probabilistic White-Box Models},
+  booktitle = {Service-Oriented Computing -- ICSOC 2025},
+  editor    = {Aiello, Marco and Deng, Shuiguang and Murillo, Juan M. and Georgievski, Ilche and Benatallah, Boualem and Wang, Zhongjie},
+  series    = {Lecture Notes in Computer Science},
+  volume    = {16321},
+  publisher = {Springer, Singapore},
+  year      = {2026},
+  doi       = {10.1007/978-981-95-5015-9_24}
+}
+```
