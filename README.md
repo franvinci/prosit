@@ -1,5 +1,10 @@
 # Prosit — PROcess SImulation Tool
 
+[![PyPI version](https://img.shields.io/pypi/v/prosit-pm.svg)](https://pypi.org/project/prosit-pm/)
+[![Python versions](https://img.shields.io/pypi/pyversions/prosit-pm.svg)](https://pypi.org/project/prosit-pm/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+
 Prosit is a Python library for **rule-aware business process simulation**. Given an event log in XES format and a Petri net process model, it automatically discovers simulation parameters (arrival rates, execution times, waiting times, resource assignments, routing probabilities) and runs discrete-event simulations that reproduce the statistical behaviour of the original process.
 
 Unlike basic simulation tools, Prosit builds **conditional models** — decision trees that learn *when* each resource is preferred, *how long* an activity takes depending on the case context, and *which path* is taken at decision points.
@@ -24,52 +29,54 @@ Unlike basic simulation tools, Prosit builds **conditional models** — decision
 
 ## Installation
 
-**Requirements:** Python 3.10
+**Requirements:** Python >= 3.10
 
-### Option 1 — Conda (recommended)
+### Option 1 — pip (recommended)
 
 ```bash
-git clone https://github.com/franvinci/prosit
-cd prosit
-conda env create -f environment.yml
-conda activate prosit
+pip install prosit-pm
 ```
 
-### Option 2 — pip
+### Option 2 — Conda
+
+```bash
+conda create -n prosit python=3.10
+conda activate prosit
+pip install prosit-pm
+```
+
+### Option 3 — From source (development)
 
 ```bash
 git clone https://github.com/franvinci/prosit
 cd prosit
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ### Dependencies
 
-| Package | Version | Purpose |
+| Package | Min version | Purpose |
 |---|---|---|
-| `pm4py` | 2.4.1 | Event log parsing, Petri net discovery and conformance |
-| `scikit-learn` | 1.1.3 | Decision tree models (batch discovery) |
-| `river` | 0.22.0 | Hoeffding Adaptive Tree (incremental discovery) |
-| `scipy` | 1.14.1 | Distribution fitting and sampling |
-| `numpy` | 1.26.4 | Numerical operations |
-| `pandas` | 2.2.3 | Feature DataFrame construction |
-| `tqdm` | 4.64.1 | Progress bars |
-| `graphviz` | 0.20.3 | Decision tree visualisation |
+| `pm4py` | 2.4 | Event log parsing, Petri net discovery and conformance |
+| `scikit-learn` | 1.1 | Decision tree models (batch discovery) |
+| `river` | 0.22 | Hoeffding Adaptive Tree (incremental discovery) |
+| `scipy` | 1.14 | Distribution fitting and sampling |
+| `numpy` | 1.26 | Numerical operations |
+| `pandas` | 2.2 | Feature DataFrame construction |
+| `tqdm` | 4.64 | Progress bars |
+| `graphviz` | 0.20 | Decision tree visualisation (also requires the system Graphviz binary) |
 
 ---
 
 ## Quick Start
 
 ```python
-import sys
-sys.path.append("src/")
-
 import warnings
 warnings.filterwarnings("ignore")
 
 import pm4py
 import pm4py.objects.log.importer.xes.importer as xes_importer
-from prosit.simulator import SimulatorParameters, SimulatorEngine
+from prosit import SimulatorParameters, SimulatorEngine
 
 # 1. Load event log
 log = xes_importer.apply("data/logs/purchasing.xes")
@@ -352,15 +359,12 @@ sim_log = engine.apply(n_traces=1000)
 ### Full workflow with evaluation
 
 ```python
-import sys
-sys.path.append("src/")
-
 import warnings
 warnings.filterwarnings("ignore")
 
 import pm4py
 import pm4py.objects.log.importer.xes.importer as xes_importer
-from prosit.simulator import SimulatorParameters, SimulatorEngine
+from prosit import SimulatorParameters, SimulatorEngine
 from datetime import datetime
 
 # Load log

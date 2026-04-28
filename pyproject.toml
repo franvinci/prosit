@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "prosit-pm"
+version = "1.0.2"
+description = "PROcess SImulation Tool — rule-aware business process simulation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Francesco Vinci", email = "vincifrancesco101@gmail.com" }]
+keywords = ["process-mining", "simulation", "petri-net", "bpm", "discrete-event"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numpy>=1.26,<2",
+    "pandas>=2.2",
+    "pm4py>=2.4",
+    "scikit-learn>=1.1",
+    "scipy>=1.14",
+    "tqdm>=4.64",
+    "river>=0.22,<0.23 ; python_version < '3.11'",
+    "river>=0.22 ; python_version >= '3.11'",
+    "graphviz>=0.20",
+]
+
+[project.urls]
+Homepage = "https://github.com/franvinci/prosit"
+Repository = "https://github.com/franvinci/prosit"
+Issues = "https://github.com/franvinci/prosit/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/prosit"]
