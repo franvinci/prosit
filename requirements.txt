@@ -1,4 +1,6 @@
 graphviz==0.20.3
+joblib==1.5.2
+log-distance-measures==2.0.0
 numpy==1.26.4
 pandas==2.2.3
 pm4py==2.4.1

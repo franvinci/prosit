@@ -133,3 +133,12 @@ dmypy.json
 # Project specific
 *.json
 results/
+dsim/
+dsim_2/
+RIMS/
+RESULT_RIMS_SPECIAL_ISSUE/
+simod/
+agentsimulator/
+raw_logs/
+exp_data/
+prepare_exp_data.py
