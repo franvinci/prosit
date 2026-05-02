@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prosit-pm"
-version = "1.0.2"
+version = "1.0.3"
 description = "PROcess SImulation Tool — rule-aware business process simulation"
 readme = "README.md"
 requires-python = ">=3.10"
