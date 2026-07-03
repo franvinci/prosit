@@ -27,7 +27,7 @@ def incremental_model_arrival_learning(
         clf_arrival.learn_one(X_row, y_row)
 
     model_arrival = DecisionRules()
-    model_arrival.from_river_decision_tree(clf_arrival, distribution=True, min_value=df['arrival_time'].min(), max_value=df['arrival_time'].max())
+    model_arrival.from_river_decision_tree(clf_arrival, distribution=True, min_value=float(df['arrival_time'].min()), max_value=float(df['arrival_time'].max()))
 
     return model_arrival
 
@@ -68,7 +68,7 @@ def incremental_execution_time_learning(
             clf_act.learn_one(X_row, y_row)
 
         clf = DecisionRules()
-        clf.from_river_decision_tree(clf_act, distribution=True, min_value=df_act['execution_time'].min(), max_value=df_act['execution_time'].max())
+        clf.from_river_decision_tree(clf_act, distribution=True, min_value=float(df_act['execution_time'].min()), max_value=float(df_act['execution_time'].max()))
         models_act[act] = clf
 
     return models_act
@@ -109,7 +109,7 @@ def incremental_waiting_time_learning(
             clf_res.learn_one(X_row, y_row)
 
         clf = DecisionRules()
-        clf.from_river_decision_tree(clf_res, distribution=True, min_value=df_res['waiting_time'].min(), max_value=df_res['waiting_time'].max())
+        clf.from_river_decision_tree(clf_res, distribution=True, min_value=float(df_res['waiting_time'].min()), max_value=float(df_res['waiting_time'].max()))
         models_res[res] = clf
 
     return models_res

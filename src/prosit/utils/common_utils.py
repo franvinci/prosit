@@ -472,8 +472,13 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
 
     # Per-candidate queue length at enabling time (used by the resource
     # assignment classifier — mirrors candidate_workloads).
-    df['candidate_queue_lengths'] = None
+    # Build the column as a positional list and assign it once (mirrors how
+    # ``candidate_workloads`` is created via the DataFrame constructor). The
+    # previous per-row ``df.at[i, col] = <dict>`` raises "Incompatible indexer
+    # with Series" on pandas >= 2.x (it aligns the dict RHS as a Series).
+    cql_col = [None] * len(df)
     if sync_mask_full.any():
+        pos = {idx: p for p, idx in enumerate(df.index)}
         for i in df[sync_mask_full].index:
             cw = df.at[i, 'candidate_workloads']
             if not isinstance(cw, dict):
@@ -488,6 +493,7 @@ def build_df_features(log, net, im, fm, act_to_resources, net_transition_labels,
                     cq[cand] = a - b
                 else:
                     cq[cand] = 0
-            df.at[i, 'candidate_queue_lengths'] = cq
+            cql_col[pos[i]] = cq
+    df['candidate_queue_lengths'] = cql_col
 
     return df

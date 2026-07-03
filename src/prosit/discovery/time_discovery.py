@@ -113,21 +113,36 @@ def discover_waiting_time(
 
 # BUILD ML MODELS
 
-def _wasserstein_cv_score_no_rule(y_arr, random_state, n_splits=5) -> float:
+def _crps_leaf(train_y, test_y, rng, cap=500):
+    """Sum of the per-observation CRPS of held-out ``test_y`` under the
+    predictive sample given by ``train_y`` (sub-sampled to ``cap`` for the
+    O(m^2)/O(m*n) terms), plus the count.
+
+    CRPS(F, y) = E|X - y| - 0.5 E|X - X'|  with X, X' ~ F : the proper-scoring-
+    rule generalisation of absolute error to a *predicted distribution*. It is
+    minimised when F is both well-placed on y and appropriately spread, so it
+    rewards capturing the conditional mean/rate (unlike the per-leaf self-
+    Wasserstein, which only measured intra-leaf stability). Lower = better."""
+    S = train_y if len(train_y) <= cap else rng.choice(train_y, cap, replace=False)
+    half_spread = 0.5 * np.abs(S[:, None] - S[None, :]).mean()
+    crps = np.abs(S[:, None] - test_y[None, :]).mean(axis=0) - half_spread
+    return float(crps.sum()), len(test_y)
+
+
+def _crps_cv_score_no_rule(y_arr, random_state, n_splits=5) -> float:
     # Baseline candidate for the CV: no tree at all, just the global empirical
-    # distribution. Score = average per-fold Wasserstein(y_te, y_tr), aligned
-    # with the tree scorer so the two are directly comparable.
+    # distribution as predictive sample. Held-out CRPS, fold-averaged; directly
+    # comparable to the tree scorer (same folds). Lower = better.
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    rng = np.random.default_rng(random_state)
     fold_scores = []
     for train_idx, test_idx in kf.split(y_arr):
         y_tr, y_te = y_arr[train_idx], y_arr[test_idx]
         if len(y_te) == 0 or len(y_tr) == 0:
             continue
-        try:
-            w = wasserstein_distance(y_te, y_tr)
-        except Exception:
-            continue
-        fold_scores.append(w)
+        s, n = _crps_leaf(y_tr, y_te, rng)
+        if n > 0:
+            fold_scores.append(s / n)
     if not fold_scores:
         return float('inf')
     return float(np.mean(fold_scores))
@@ -161,12 +176,16 @@ def _build_no_rule_decision_rules(y, use_outlier_removal: bool = True) -> Decisi
     return clf
 
 
-def _wasserstein_cv_score(X_arr, y_arr, max_depth, min_samples_leaf, random_state, n_splits=5) -> float:
-    # Per-leaf empirical Wasserstein averaged across folds, weighted by
-    # held-out leaf size. Aligned with the ctd metric (Wasserstein on cycle
-    # time) rather than R², and robust to the heavy-tailed y typical of
-    # waiting/arrival time.
+def _crps_cv_score(X_arr, y_arr, max_depth, min_samples_leaf, random_state, n_splits=5) -> float:
+    # Held-out CRPS of the tree's per-leaf predictive distributions: each
+    # held-out point is scored against the train values of its own leaf,
+    # leaf-size-weighted and fold-averaged. Replaces the per-leaf self-
+    # Wasserstein, which measured intra-leaf stability (insensitive to
+    # conditional mean/rate shifts and biased against finer splits). Since CRPS
+    # is a proper scoring rule it rewards splits that better match the held-out
+    # conditional distribution. Lower = better; comparable to the no-rule score.
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    rng = np.random.default_rng(random_state)
     fold_scores = []
     for train_idx, test_idx in kf.split(X_arr):
         X_tr, X_te = X_arr[train_idx], X_arr[test_idx]
@@ -187,12 +206,9 @@ def _wasserstein_cv_score(X_arr, y_arr, max_depth, min_samples_leaf, random_stat
             y_tr_l = y_tr[leaves_tr == l]
             if len(y_te_l) == 0 or len(y_tr_l) == 0:
                 continue
-            try:
-                w = wasserstein_distance(y_te_l, y_tr_l)
-            except Exception:
-                continue
-            weighted += w * len(y_te_l)
-            total += len(y_te_l)
+            s, n = _crps_leaf(y_tr_l, y_te_l, rng)
+            weighted += s
+            total += n
         if total > 0:
             fold_scores.append(weighted / total)
     if not fold_scores:
@@ -216,11 +232,11 @@ def _fit_decision_rules(X, y, param_grid, max_depths, random_state, use_outlier_
         if len(X) > 6:
             X_arr = X.values if hasattr(X, 'values') else np.asarray(X)
             y_arr = np.asarray(y)
-            best_score = _wasserstein_cv_score_no_rule(y_arr, random_state)
+            best_score = _crps_cv_score_no_rule(y_arr, random_state)
             best_params = 'no_rule' if best_score != float('inf') else None
             for md in param_grid['max_depth']:
                 for msl in param_grid['min_samples_leaf']:
-                    s = _wasserstein_cv_score(X_arr, y_arr, md, msl, random_state)
+                    s = _crps_cv_score(X_arr, y_arr, md, msl, random_state)
                     if s < best_score:
                         best_score = s
                         best_params = (md, msl)

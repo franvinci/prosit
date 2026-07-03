@@ -227,7 +227,7 @@ def transform_river_decision_tree_data(decision_tree, distribution=True, min_val
 
             return {0: {'value': value, 'sampled': sampled_values, 'dist': (getattr(stats, "norm"), (value, std_dev), min_value, max_value)}}
         else:
-            value = decision_tree.predict_proba_one({})[1]
+            value = decision_tree.predict_proba_one({}).get(1, 0.0)
             return {0: {"value": value}}
 
     transformed_data = {}
@@ -276,7 +276,11 @@ def transform_river_decision_tree_data(decision_tree, distribution=True, min_val
                     'dist': (getattr(stats, "norm"), (value, std_dev), min_value, max_value)
                 }
             else:
-                value = row['stats'][1]/(row['stats'][0]+row['stats'][1])
+                node_stats = row['stats']
+                n0 = node_stats.get(0, 0)
+                n1 = node_stats.get(1, 0)
+                total = n0 + n1
+                value = (n1 / total) if total > 0 else 0.0
                 transformed_data[node_id] = {'value': value}
 
     transformed_data_sorted = dict(sorted(transformed_data.items()))
