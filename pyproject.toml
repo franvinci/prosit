@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prosit-pm"
-version = "1.0.3"
+version = "1.0.4"
 description = "PROcess SImulation Tool — rule-aware business process simulation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,12 +19,13 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
+    "joblib>=1.2",
     "numpy>=1.26,<2",
     "pandas>=2.2",
     "pm4py>=2.4",
-    "scikit-learn>=1.1",
+    "scikit-learn>=1.5",
     "scipy>=1.14",
-    "tqdm>=4.64",
+    "tqdm>=4.66.3",
     "river>=0.22,<0.23 ; python_version < '3.11'",
     "river>=0.22 ; python_version >= '3.11'",
     "graphviz>=0.20",

@@ -58,12 +58,13 @@ pip install -e .
 | Package | Min version | Purpose |
 |---|---|---|
 | `pm4py` | 2.4 | Event log parsing, Petri net discovery and conformance |
-| `scikit-learn` | 1.1 | Decision tree models (batch discovery) |
+| `scikit-learn` | 1.5 | Decision tree models (batch discovery) |
+| `joblib` | 1.2 | Parallel model fitting |
 | `river` | 0.22 | Hoeffding Adaptive Tree (incremental discovery) |
 | `scipy` | 1.14 | Distribution fitting and sampling |
 | `numpy` | 1.26 | Numerical operations |
 | `pandas` | 2.2 | Feature DataFrame construction |
-| `tqdm` | 4.64 | Progress bars |
+| `tqdm` | 4.66.3 | Progress bars |
 | `graphviz` | 0.20 | Decision tree visualisation (also requires the system Graphviz binary) |
 
 ---
@@ -477,7 +478,7 @@ History features are expressed as **raw counts** (number of times each activity 
 
 Before each classifier or regressor is fit, low-signal columns are pruned automatically: constant columns are dropped, and one-hot columns (resources, activities, categorical attribute values) with fewer than 20 positive observations in the current training slice are removed. This reduces noise from rare categories and keeps the CV grid compact.
 
-For the time-regression models, cross-validation selects between every `(max_depth, min_samples_leaf)` combination **and** a no-tree baseline (global empirical distribution). If no candidate tree beats the baseline on per-leaf Wasserstein distance, the model collapses to a single unconditional distribution.
+For the time-regression models, cross-validation selects between every `(max_depth, min_samples_leaf)` combination **and** a no-tree baseline (global empirical distribution). If no candidate tree beats the baseline on held-out CRPS, the model collapses to a single unconditional distribution.
 
 ### Distribution fitting
 
