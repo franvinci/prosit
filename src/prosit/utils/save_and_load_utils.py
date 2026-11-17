@@ -1,6 +1,5 @@
 from prosit.utils.rule_utils import DecisionRules
 from pm4py.objects.petri_net.obj import PetriNet
-import copy
 import scipy.stats as stats
 
 
@@ -63,7 +62,10 @@ def decision_rules_to_dict(d: DecisionRules) -> dict:
             d = 1
         return _to_py(d)
 
-    return convert(copy.deepcopy(d.rules))
+    # ``convert`` builds new containers all the way down and skips the
+    # ``sampled`` pools, so the rules need no defensive copy first (which used
+    # to duplicate every pool and every scipy distribution just to drop them).
+    return convert(d.rules)
 
 
 def convert_calendar_names(calendar: dict, to_number = False):

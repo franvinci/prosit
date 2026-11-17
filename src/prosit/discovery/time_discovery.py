@@ -1,3 +1,5 @@
+from datetime import timezone
+
 import numpy as np
 from joblib import Parallel, delayed
 import pandas as pd
@@ -5,6 +7,7 @@ import pm4py
 
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.model_selection import KFold
+import scipy.stats as stats
 from scipy.stats import wasserstein_distance
 
 from pm4py.objects.log.obj import EventLog
@@ -15,6 +18,8 @@ from prosit.utils.common_utils import (
     parallel_with_progress,
     seed_worker_from_key,
     DEFAULT_N_JOBS,
+    ModelPlan,
+    run_model_plans,
 )
 from prosit.utils.distribution_utils import return_best_distribution, sampling_from_dist, remove_outliers
 from prosit.utils.rule_utils import DecisionRules, prune_low_signal_columns
@@ -22,6 +27,9 @@ from prosit.utils.rule_utils import DecisionRules, prune_low_signal_columns
 
 DIST_SEARCH = ['fixed', 'norm', 'expon', 'lognorm', 'gamma', 'uniform']
 DEFAULT_SAMPLE_SIZE = 1000
+# Relative cost of a time-model fit versus a classifier fit of the same size,
+# only used to order the jobs of a shared pool (heaviest first).
+_TIME_JOB_WEIGHT = 3
 
 
 # DISCOVERY
@@ -108,6 +116,99 @@ def discover_waiting_time(
                                                         )
 
     return res_waiting_time_distributions
+
+
+
+def _global_distribution(dist):
+    """The ``scipy.stats`` distribution with the name of ``dist``.
+
+    A distribution object that comes back from a worker process is a copy
+    carrying that worker's random state: sampling from it ignores
+    ``np.random.seed`` in this process, so a simulation run on freshly
+    discovered parameters could not be reproduced. The module-level object
+    draws from numpy's global generator, like the ones rebuilt by
+    ``from_json``."""
+    if isinstance(dist, str):
+        return dist
+    return getattr(stats, getattr(dist, 'name', ''), dist)
+
+
+def _with_global_distribution(model):
+    """``model`` (a no-rules ``(dist, params, min, max, mean)`` tuple or a
+    ``DecisionRules`` with one ``dist`` per leaf) pointing at the global
+    scipy distributions."""
+    if isinstance(model, tuple) and model:
+        return (_global_distribution(model[0]),) + model[1:]
+    rules = getattr(model, 'rules', None)
+    if isinstance(rules, dict):
+        for node in rules.values():
+            if isinstance(node, dict) and isinstance(node.get('dist'), tuple) and node['dist']:
+                node['dist'] = (_global_distribution(node['dist'][0]),) + node['dist'][1:]
+    return model
+
+
+def plan_execution_time_distributions(
+        df_features: pd.DataFrame,
+        net_transition_labels: list,
+        resources: list,
+        calendars: dict,
+        max_depths: list = range(1,6),
+        min_samples_leaf_cv: list = [50, 100, 200],
+        label_data_attributes: list = [],
+        label_data_attributes_categorical: list = [],
+        values_categorical: dict = dict(),
+        random_state: int = 72
+    ) -> ModelPlan:
+    """:func:`discover_execution_time_distributions` split in two: the training
+    data are prepared here, the fits are left to ``run_model_plans``."""
+
+    if not max_depths:
+        return _plan_best_distribution_ex(df_features, net_transition_labels, calendars)
+    return _plan_models_ex(
+        df_features,
+        net_transition_labels,
+        resources,
+        calendars,
+        label_data_attributes,
+        label_data_attributes_categorical,
+        values_categorical,
+        max_depths,
+        min_samples_leaf_cv,
+        random_state=random_state
+    )
+
+
+def plan_waiting_time(
+        df_features: pd.DataFrame,
+        net_transition_labels: list,
+        resources: list,
+        calendars: dict,
+        label_data_attributes: list,
+        label_data_attributes_categorical: list,
+        values_categorical: dict,
+        max_depths: list = range(1,6),
+        min_samples_leaf_cv: list = [50, 100, 200],
+        random_state: int = 72,
+        use_workload_features: bool = False,
+    ) -> ModelPlan:
+    """:func:`discover_waiting_time` split in two, like
+    :func:`plan_execution_time_distributions`."""
+
+    if not max_depths:
+        return _plan_best_distribution_wt(df_features, resources, calendars)
+    return _plan_models_wt(
+        df_features,
+        net_transition_labels,
+        resources,
+        calendars,
+        label_data_attributes,
+        label_data_attributes_categorical,
+        values_categorical,
+        max_depths,
+        min_samples_leaf_cv,
+        random_state=random_state,
+        use_workload_features=use_workload_features,
+    )
 
 
 
@@ -314,6 +415,33 @@ def build_models_ex(
         random_state: int = 72
     ) -> dict:
 
+    return run_model_plans([_plan_models_ex(
+        df_features,
+        activity_labels,
+        resources,
+        calendars,
+        label_data_attributes,
+        label_data_attributes_categorical,
+        values_categorical,
+        max_depths,
+        min_samples_leaf_cv,
+        random_state=random_state
+    )])[0]
+
+
+def _plan_models_ex(
+        df_features: pd.DataFrame,
+        activity_labels: list,
+        resources: list,
+        calendars: dict,
+        label_data_attributes: list,
+        label_data_attributes_categorical: list,
+        values_categorical: dict,
+        max_depths: list = range(1,6),
+        min_samples_leaf_cv: list = [50, 100, 200],
+        random_state: int = 72
+    ) -> ModelPlan:
+
     df = build_training_df_ex(
                                 df_features,
                                 resources,
@@ -331,15 +459,16 @@ def build_models_ex(
     df_by_act = {a: grp.iloc[:, 1:] for a, grp in df.groupby('activity_executed', sort=False)}
     empty_slice = df.iloc[0:0, 1:]
 
-    jobs = (
-        delayed(_fit_one_ex_worker)(
-            act, df_by_act.get(act, empty_slice),
-            param_grid, max_depths, random_state,
-        )
-        for act in activity_labels
+    slices = [df_by_act.get(act, empty_slice) for act in activity_labels]
+    return ModelPlan(
+        jobs=[
+            delayed(_fit_one_ex_worker)(act, df_act, param_grid, max_depths, random_state)
+            for act, df_act in zip(activity_labels, slices)
+        ],
+        finish=lambda fitted: {act: _with_global_distribution(fitted[act]) for act in activity_labels},
+        desc='exec-time models',
+        sizes=[_TIME_JOB_WEIGHT * df_act.shape[0] * df_act.shape[1] for df_act in slices],
     )
-    results = parallel_with_progress(jobs, total=len(activity_labels), desc='exec-time models')
-    return dict(results)
 
 
 
@@ -357,6 +486,35 @@ def build_models_wt(
         use_workload_features: bool = False,
     ) -> dict:
 
+    return run_model_plans([_plan_models_wt(
+        df_features,
+        activity_labels,
+        resources,
+        calendars,
+        label_data_attributes,
+        label_data_attributes_categorical,
+        values_categorical,
+        max_depths,
+        min_samples_leaf_cv,
+        random_state=random_state,
+        use_workload_features=use_workload_features,
+    )])[0]
+
+
+def _plan_models_wt(
+        df_features: pd.DataFrame,
+        activity_labels: list,
+        resources: list,
+        calendars: dict,
+        label_data_attributes: list,
+        label_data_attributes_categorical: list,
+        values_categorical: dict,
+        max_depths: list = range(1,6),
+        min_samples_leaf_cv: list = [50, 100, 200],
+        random_state: int = 72,
+        use_workload_features: bool = False,
+    ) -> ModelPlan:
+
     df = build_training_df_wt(
                                 df_features,
                                 activity_labels,
@@ -372,15 +530,16 @@ def build_models_wt(
     df_by_res = {r: grp.iloc[:, 1:] for r, grp in df.groupby('resource', sort=False)}
     empty_slice = df.iloc[0:0, 1:]
 
-    jobs = (
-        delayed(_fit_one_wt_worker)(
-            res, df_by_res.get(res, empty_slice),
-            param_grid, max_depths, random_state,
-        )
-        for res in resources
+    slices = [df_by_res.get(res, empty_slice) for res in resources]
+    return ModelPlan(
+        jobs=[
+            delayed(_fit_one_wt_worker)(res, df_res, param_grid, max_depths, random_state)
+            for res, df_res in zip(resources, slices)
+        ],
+        finish=lambda fitted: {res: _with_global_distribution(fitted[res]) for res in resources},
+        desc='waiting-time models',
+        sizes=[_TIME_JOB_WEIGHT * df_res.shape[0] * df_res.shape[1] for df_res in slices],
     )
-    results = parallel_with_progress(jobs, total=len(resources), desc='waiting-time models')
-    return dict(results)
 
 
 
@@ -393,16 +552,15 @@ def build_training_df_arrival(
 
     df_log = pm4py.convert_to_dataframe(log)
     first_ts = df_log.groupby('case:concept:name')["start:timestamp"].min()
-    ordered_first_ts_list = first_ts.sort_values().tolist()
+    ordered_first_ts = first_ts.sort_values()
+    previous_arrivals = ordered_first_ts.tolist()[:-1]
 
-    dict_df = {'hour': [], 'weekday': [], 'arrival_time': []}
     arrival_working_set = calendar_to_working_set(calendar_arrival)
-
-    for i in range(1, len(ordered_first_ts_list)):
-        prev_ts = ordered_first_ts_list[i-1]
-        dict_df['hour'].append(prev_ts.hour)
-        dict_df['weekday'].append(prev_ts.weekday())
-        dict_df['arrival_time'].append(count_working_minutes(prev_ts, ordered_first_ts_list[i], calendar_arrival, arrival_working_set))
+    dict_df = {
+        'hour': [prev_ts.hour for prev_ts in previous_arrivals],
+        'weekday': [prev_ts.weekday() for prev_ts in previous_arrivals],
+        'arrival_time': _arrival_gaps(ordered_first_ts, calendar_arrival, arrival_working_set),
+    }
 
     df = pd.DataFrame(dict_df)
 
@@ -422,6 +580,148 @@ def _waiting_time_chunk(chunk, calendars, working_sets):
         lambda x: count_working_minutes(x["resource_free_t"], x["start_t"], calendars[x["resource"]], working_sets[x["resource"]]),
         axis=1,
     )
+
+
+_HOUR_US = 3600 * 10**6
+_WEEK_US = 7 * 24 * _HOUR_US
+_MINUTE_US = 60 * 10**6
+_MONDAY_US = 4 * 24 * _HOUR_US          # 1970-01-05 00:00, the first Monday after the epoch
+
+
+def _wall_microseconds(values):
+    """Wall-clock microseconds since the epoch of a datetime64 Series, plus a
+    mask of the values that carry sub-microsecond digits (which the integer
+    arithmetic below cannot follow). ``None`` when the Series is not a
+    NaT-free datetime64 in UTC, a fixed offset or no timezone at all: only
+    then is elapsed time the same thing as elapsed wall-clock time."""
+    if not pd.api.types.is_datetime64_any_dtype(values.dtype) or values.isna().any():
+        return None
+    tz = values.dt.tz
+    if tz is not None:
+        if not (isinstance(tz, timezone) or str(tz) == 'UTC'):
+            return None
+        values = values.dt.tz_localize(None)
+    unit = getattr(values.dt, 'unit', 'ns')
+    ints = values.astype('int64').to_numpy()
+    if unit == 'ns':
+        return ints // 1000, (ints % 1000) != 0
+    scale = {'us': 1, 'ms': 10**3, 's': 10**6}.get(unit)
+    if scale is None:
+        return None
+    return ints * scale, np.zeros(len(ints), dtype=bool)
+
+
+def _working_microseconds_since_epoch(wall_us, working_slots):
+    """Working time elapsed between the reference Monday and each instant,
+    for a weekly calendar given as 168 booleans (weekday * 24 + hour)."""
+    rel = wall_us - _MONDAY_US
+    weeks = rel // _WEEK_US
+    within = rel - weeks * _WEEK_US
+    slot = within // _HOUR_US
+    before_slot = np.concatenate(([0], np.cumsum(working_slots, dtype=np.int64))) * _HOUR_US
+    in_slot = np.where(working_slots[slot], within - slot * _HOUR_US, 0)
+    return weeks * before_slot[-1] + before_slot[slot] + in_slot
+
+
+def _working_minutes(start, end, resource, calendars, working_sets):
+    """``count_working_minutes(start, end, calendars[r], working_sets[r])`` for
+    every row, as an int64 array.
+
+    Working time is accumulated in whole microseconds from a 168-slot table
+    per calendar and rounded to minutes half-to-even, which is what the
+    scalar function returns whenever its float sum is not exactly on a half
+    minute. Rows that do land on a half minute — where the scalar result
+    depends on the order of its additions — and rows with sub-microsecond
+    timestamps are handed to the scalar function itself.
+
+    Returns ``None`` when the columns cannot be treated this way (see
+    ``_wall_microseconds``) or a resource has no calendar; the caller then
+    uses the scalar path for everything."""
+    n = len(start)
+    if n == 0:
+        return None
+    if not (pd.api.types.is_datetime64_any_dtype(start.dtype) and pd.api.types.is_datetime64_any_dtype(end.dtype)):
+        return None
+    if start.dt.tz != end.dt.tz or getattr(start.dt, 'unit', 'ns') != getattr(end.dt, 'unit', 'ns'):
+        return None
+    start_us = _wall_microseconds(start)
+    end_us = _wall_microseconds(end)
+    if start_us is None or end_us is None:
+        return None
+    start_us, start_inexact = start_us
+    end_us, end_inexact = end_us
+    needs_scalar = start_inexact | end_inexact
+    out = np.zeros(n, dtype=np.int64)
+    # Same tz and same unit: the raw integers order like the instants.
+    positive = end.astype('int64').to_numpy() > start.astype('int64').to_numpy()
+
+    resources = resource.to_numpy()
+    try:
+        groups = pd.Series(np.arange(n)).groupby(resources, sort=False, dropna=False).indices
+    except TypeError:
+        return None
+    for res, pos in groups.items():
+        if res not in working_sets or res not in calendars:
+            return None
+        working_slots = np.zeros(168, dtype=bool)
+        for weekday, hour in working_sets[res]:
+            if isinstance(weekday, (int, np.integer)) and isinstance(hour, (int, np.integer)) and 0 <= weekday < 7 and 0 <= hour < 24:
+                working_slots[weekday * 24 + hour] = True
+        worked = (_working_microseconds_since_epoch(end_us[pos], working_slots)
+                  - _working_microseconds_since_epoch(start_us[pos], working_slots))
+        minutes, rest = np.divmod(worked, _MINUTE_US)
+        is_positive = positive[pos]
+        out[pos] = np.where(is_positive, minutes + (2 * rest > _MINUTE_US), 0)
+        needs_scalar[pos] |= is_positive & (2 * rest == _MINUTE_US)
+    needs_scalar &= positive
+
+    scalar_rows = np.flatnonzero(needs_scalar)
+    if len(scalar_rows):
+        start_values = start.tolist()
+        end_values = end.tolist()
+        for i in scalar_rows.tolist():
+            res = resources[i]
+            out[i] = count_working_minutes(start_values[i], end_values[i], calendars[res], working_sets[res])
+    return out
+
+
+def _hour_and_weekday(values):
+    """Wall-clock hour and weekday of a timestamp column, as int64 Series."""
+    if len(values) and pd.api.types.is_datetime64_any_dtype(values.dtype) and not values.isna().any():
+        return values.dt.hour.astype('int64'), values.dt.weekday.astype('int64')
+    return values.apply(lambda ts: ts.hour), values.apply(lambda ts: ts.weekday())
+
+
+_ARRIVAL_KEY = '__arrival__'
+
+
+def _arrival_gaps(ordered_first_ts, calendar_arrival, arrival_working_set) -> list:
+    """Working minutes between consecutive case arrivals (sorted Series)."""
+    n_gaps = len(ordered_first_ts) - 1
+    if n_gaps >= 1:
+        minutes = _working_minutes(
+            ordered_first_ts.iloc[:-1].reset_index(drop=True),
+            ordered_first_ts.iloc[1:].reset_index(drop=True),
+            pd.Series([_ARRIVAL_KEY] * n_gaps),
+            {_ARRIVAL_KEY: calendar_arrival},
+            {_ARRIVAL_KEY: arrival_working_set},
+        )
+        if minutes is not None:
+            return minutes.tolist()
+    values = ordered_first_ts.tolist()
+    return [
+        count_working_minutes(values[i - 1], values[i], calendar_arrival, arrival_working_set)
+        for i in range(1, len(values))
+    ]
+
+
+def _working_minutes_column(df, start_col, end_col, calendars, working_sets, chunk_fn):
+    """Working minutes between two timestamp columns of ``df`` (which also
+    holds ``resource``), index-aligned with ``df``."""
+    minutes = _working_minutes(df[start_col], df[end_col], df["resource"], calendars, working_sets)
+    if minutes is None:
+        return _parallel_working_minutes(df, calendars, working_sets, chunk_fn)
+    return pd.Series(minutes, index=df.index)
 
 
 def _parallel_working_minutes(df, calendars, working_sets, chunk_fn):
@@ -453,11 +753,10 @@ def build_training_df_ex(
     df_et = df_features[["transition_label", "resource", "start_t", "end_t"] + label_data_attributes + list(activity_labels)]
     df_et = df_et[~df_et["start_t"].isna()]
     working_sets_ex = {r: calendar_to_working_set(calendars[r]) for r in calendars}
-    df_et["execution_time"] = _parallel_working_minutes(
-        df_et[["start_t", "end_t", "resource"]], calendars, working_sets_ex, _exec_time_chunk,
+    df_et["execution_time"] = _working_minutes_column(
+        df_et[["start_t", "end_t", "resource"]], "start_t", "end_t", calendars, working_sets_ex, _exec_time_chunk,
     )
-    df_et["hour"] = df_et["start_t"].apply(lambda ts: ts.hour)
-    df_et["weekday"] = df_et["start_t"].apply(lambda ts: ts.weekday())
+    df_et["hour"], df_et["weekday"] = _hour_and_weekday(df_et["start_t"])
     df_et.drop(columns=["start_t", "end_t"], inplace=True)
     df_et.rename(columns={"transition_label": "activity_executed"}, inplace=True)
     df_et.reset_index(drop=True, inplace=True)
@@ -491,11 +790,10 @@ def build_training_df_wt(
     df_wt = df_features[base_cols]
     df_wt = df_wt[~df_wt["start_t"].isna()]
     working_sets_wt = {r: calendar_to_working_set(calendars[r]) for r in calendars}
-    df_wt["waiting_time"] = _parallel_working_minutes(
-        df_wt[["start_t", "resource_free_t", "resource"]], calendars, working_sets_wt, _waiting_time_chunk,
+    df_wt["waiting_time"] = _working_minutes_column(
+        df_wt[["start_t", "resource_free_t", "resource"]], "resource_free_t", "start_t", calendars, working_sets_wt, _waiting_time_chunk,
     )
-    df_wt["hour"] = df_wt["resource_free_t"].apply(lambda ts: ts.hour)
-    df_wt["weekday"] = df_wt["resource_free_t"].apply(lambda ts: ts.weekday())
+    df_wt["hour"], df_wt["weekday"] = _hour_and_weekday(df_wt["resource_free_t"])
     df_wt.drop(columns=["start_t", "resource_free_t"], inplace=True)
     if use_workload_features:
         df_wt.rename(columns={"res_workload": "workload"}, inplace=True)
@@ -522,12 +820,8 @@ def find_best_distribution_arrival(log: EventLog,
 
     df_log = pm4py.convert_to_dataframe(log)
     first_ts = df_log.groupby('case:concept:name')["start:timestamp"].min()
-    ordered_first_ts_list = first_ts.sort_values().tolist()
-
-    arrival_times = []
     arrival_working_set = calendar_to_working_set(calendar_arrival)
-    for i in range(1, len(ordered_first_ts_list)):
-        arrival_times.append(count_working_minutes(ordered_first_ts_list[i-1], ordered_first_ts_list[i], calendar_arrival, arrival_working_set))
+    arrival_times = _arrival_gaps(first_ts.sort_values(), calendar_arrival, arrival_working_set)
 
     dist, params = return_best_distribution(arrival_times, dist_search=DIST_SEARCH)
     min_value = np.min(arrival_times)
@@ -551,23 +845,35 @@ def find_best_distribution_ex(df_features: pd.DataFrame,
         calendars: dict
     ) -> dict:
 
+    return run_model_plans([_plan_best_distribution_ex(df_features, activity_labels, calendars)])[0]
+
+
+def _plan_best_distribution_ex(df_features: pd.DataFrame,
+        activity_labels: list,
+        calendars: dict
+    ) -> ModelPlan:
+
     df_et = df_features[["transition_label", "resource", "start_t", "end_t"]]
     df_et = df_et[~df_et["start_t"].isna()]
     working_sets_ex2 = {r: calendar_to_working_set(calendars[r]) for r in calendars}
-    df_et["execution_time"] = _parallel_working_minutes(
-        df_et[["start_t", "end_t", "resource"]], calendars, working_sets_ex2, _exec_time_chunk,
+    df_et["execution_time"] = _working_minutes_column(
+        df_et[["start_t", "end_t", "resource"]], "start_t", "end_t", calendars, working_sets_ex2, _exec_time_chunk,
     )
 
     times_by_act = {
         act: grp['execution_time'].dropna().tolist()
         for act, grp in df_et.groupby('transition_label', sort=False)
     }
-    jobs = (
-        delayed(_fit_best_distribution_worker)(act, times_by_act.get(act, []), use_outlier_removal=False)
-        for act in activity_labels
+    times = [times_by_act.get(act, []) for act in activity_labels]
+    return ModelPlan(
+        jobs=[
+            delayed(_fit_best_distribution_worker)(act, act_times, use_outlier_removal=False)
+            for act, act_times in zip(activity_labels, times)
+        ],
+        finish=lambda fitted: {act: _with_global_distribution(fitted[act]) for act in activity_labels},
+        desc='exec-time distributions',
+        sizes=[len(act_times) for act_times in times],
     )
-    results = parallel_with_progress(jobs, total=len(activity_labels), desc='exec-time distributions')
-    return dict(results)
 
 
 def find_best_distribution_wt(df_features: pd.DataFrame,
@@ -577,11 +883,19 @@ def find_best_distribution_wt(df_features: pd.DataFrame,
     """Discover one global waiting-time distribution per resource (no-rules
     mode). Returns ``(dist, params, min, max, mean)`` per resource."""
 
+    return run_model_plans([_plan_best_distribution_wt(df_features, resources, calendars)])[0]
+
+
+def _plan_best_distribution_wt(df_features: pd.DataFrame,
+        resources: list,
+        calendars: dict,
+    ) -> ModelPlan:
+
     df_wt = df_features[["resource", "start_t", "resource_free_t"]]
     df_wt = df_wt[~df_wt["start_t"].isna()]
     working_sets_wt2 = {r: calendar_to_working_set(calendars[r]) for r in calendars}
-    df_wt["waiting_time"] = _parallel_working_minutes(
-        df_wt[["start_t", "resource_free_t", "resource"]], calendars, working_sets_wt2, _waiting_time_chunk,
+    df_wt["waiting_time"] = _working_minutes_column(
+        df_wt[["start_t", "resource_free_t", "resource"]], "resource_free_t", "start_t", calendars, working_sets_wt2, _waiting_time_chunk,
     )
     df_wt.reset_index(drop=True, inplace=True)
 
@@ -589,9 +903,13 @@ def find_best_distribution_wt(df_features: pd.DataFrame,
         res: grp['waiting_time'].dropna().tolist()
         for res, grp in df_wt.groupby('resource', sort=False)
     }
-    jobs = (
-        delayed(_fit_best_distribution_worker)(res, times_by_res.get(res, []), use_outlier_removal=False)
-        for res in resources
+    times = [times_by_res.get(res, []) for res in resources]
+    return ModelPlan(
+        jobs=[
+            delayed(_fit_best_distribution_worker)(res, res_times, use_outlier_removal=False)
+            for res, res_times in zip(resources, times)
+        ],
+        finish=lambda fitted: {res: _with_global_distribution(fitted[res]) for res in resources},
+        desc='waiting-time distributions',
+        sizes=[len(res_times) for res_times in times],
     )
-    results = parallel_with_progress(jobs, total=len(resources), desc='waiting-time distributions')
-    return dict(results)

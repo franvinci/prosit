@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prosit-pm"
-version = "1.0.4"
+version = "1.0.5"
 description = "PROcess SImulation Tool — rule-aware business process simulation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,7 +19,7 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-    "joblib>=1.2",
+    "joblib>=1.4",
     "numpy>=1.26,<2",
     "pandas>=2.2",
     "pm4py>=2.4",
@@ -35,6 +35,13 @@ dependencies = [
 Homepage = "https://github.com/franvinci/prosit"
 Repository = "https://github.com/franvinci/prosit"
 Issues = "https://github.com/franvinci/prosit/issues"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/prosit",
+    "/environment.yml",
+    "/requirements.txt",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/prosit"]

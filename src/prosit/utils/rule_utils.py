@@ -1,5 +1,9 @@
 import re
-from sklearn.tree import export_graphviz
+import warnings
+from sklearn.base import clone
+from sklearn.dummy import DummyClassifier
+from sklearn.model_selection import StratifiedKFold
+from sklearn.tree import DecisionTreeClassifier, export_graphviz
 from sklearn.metrics import log_loss, make_scorer
 import graphviz
 import random
@@ -34,6 +38,13 @@ def prune_low_signal_columns(X: pd.DataFrame, min_positives: int = MIN_FEATURE_P
     """
     if X.empty:
         return X
+    if not X.columns.has_duplicates and all(
+        isinstance(dt, np.dtype) and dt.kind in 'biuf' for dt in X.dtypes
+    ):
+        # Plain numeric frame: same decisions as the loop below, computed on
+        # the whole matrix at once.
+        mask = _prune_low_signal_mask(X.to_numpy(dtype=np.float64), min_positives)
+        return X[[col for col, k in zip(X.columns, mask) if k]]
     keep = []
     for col in X.columns:
         series = X[col]
@@ -45,6 +56,121 @@ def prune_low_signal_columns(X: pd.DataFrame, min_positives: int = MIN_FEATURE_P
                 continue
         keep.append(col)
     return X[keep]
+
+
+def _prune_low_signal_mask(X: np.ndarray, min_positives: int = MIN_FEATURE_POSITIVES) -> np.ndarray:
+    """Boolean column mask with the semantics of ``prune_low_signal_columns``
+    for a non-empty 2-D float array: drop single-valued columns (an all-NaN
+    column is single-valued) and 0/1 columns with fewer than ``min_positives``
+    ones. A column holding NaN next to other values is always kept, because
+    NaN is a distinct value that is not part of {0, 1}."""
+    with np.errstate(invalid='ignore'):
+        single_valued = (X == X[0:1, :]).all(axis=0)
+        binary = ((X == 0) | (X == 1)).all(axis=0)
+        positives = np.where(binary, X.sum(axis=0), min_positives)
+    keep = ~single_valued & ~(binary & (positives < min_positives))
+    nan = np.isnan(X)
+    has_nan = nan.any(axis=0)
+    if has_nan.any():
+        keep[has_nan] = ~nan.all(axis=0)[has_nan]
+    return keep
+
+
+def _grid_search_cv_equivalent(X, y, max_depths_cv, random_state, n_splits=5):
+    """Model selection for the binary transition / resource classifiers.
+
+    Reproduces, fit for fit, what ``GridSearchCV(Pipeline([('clf', ...)]),
+    param_grid=[trees with max_depth in max_depths_cv, DummyClassifier('prior')],
+    cv=5, scoring=BINARY_NEG_LOG_LOSS_SCORER)`` selects and refits: same
+    unshuffled stratified folds, same candidates in the same order, same
+    scorer, failed fits/scores counted as NaN, mean over folds, ``min`` ranking
+    with NaNs tied with the worst candidate, first best candidate refitted on
+    all the data. It skips the per-fit cloning, validation and DataFrame
+    indexing of the generic search, which dominated the run time on logs with
+    many resources. ``X`` must be a float32 array, ``y`` an integer array.
+
+    Returns the refitted tree, or the (unfitted) ``DummyClassifier`` candidate
+    when the prior-only model wins."""
+    candidates = [DecisionTreeClassifier(random_state=random_state, max_depth=d) for d in max_depths_cv]
+    candidates.append(DummyClassifier(strategy='prior', random_state=random_state))
+    splits = list(StratifiedKFold(n_splits=n_splits).split(X, y))
+    scores = np.full((len(candidates), len(splits)), np.nan)
+    n_failed_fits = 0
+    for k, (train_idx, test_idx) in enumerate(splits):
+        X_train = np.asfortranarray(X[train_idx])
+        X_test = X[test_idx]
+        y_train = y[train_idx]
+        y_test = y[test_idx]
+        for c, candidate in enumerate(candidates):
+            try:
+                fitted = clone(candidate).fit(X_train, y_train)
+            except Exception:
+                n_failed_fits += 1
+                continue
+            try:
+                scores[c, k] = BINARY_NEG_LOG_LOSS_SCORER(fitted, X_test, y_test)
+            except Exception:
+                pass
+    if n_failed_fits == scores.size:
+        raise ValueError("All the fits failed.")
+    mean_scores = np.average(scores, axis=1)
+    if np.isnan(mean_scores).all():
+        best_index = 0
+    else:
+        filled = np.nan_to_num(mean_scores, nan=np.nanmin(mean_scores) - 1)
+        best_index = int(stats.rankdata(-filled, method='min').argmin())
+    best = candidates[best_index]
+    if isinstance(best, DummyClassifier):
+        return best
+    return clone(best).fit(X, y)
+
+
+def fit_binary_tree_model(X, y, feature_names, max_depths_cv, random_state):
+    """Fit one transition / resource classifier on a float32 matrix and return
+    either a ``DecisionRules`` or, when the prior-only model wins the
+    cross-validation, the marginal probability as a float."""
+    if max_depths_cv:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                best_clf = _grid_search_cv_equivalent(X, y, list(max_depths_cv), random_state)
+        except Exception:
+            best_clf = DecisionTreeClassifier(max_depth=2, random_state=random_state).fit(X, y)
+        if isinstance(best_clf, DummyClassifier):
+            return float(y.mean())
+    else:
+        best_clf = DecisionTreeClassifier(random_state=random_state, max_depth=1)
+        best_clf.fit(X, y)
+    # The tree was fitted on a bare array: restore the column names that
+    # ``build_graph_vis`` reads from the estimator.
+    best_clf.feature_names_in_ = np.asarray(feature_names, dtype=object)
+    clf = DecisionRules()
+    clf.from_decision_tree(best_clf)
+    return clf
+
+
+def fit_classifier_task(key, base, rows, y, feature_names, max_depths_cv, random_state,
+                        extra=None, extra_at=None, marginal_guards=False, n_cv=5):
+    """Joblib worker: build one training matrix out of the shared ``base``
+    (rows selected by ``rows``, optional per-task columns ``extra`` inserted at
+    column ``extra_at``), prune it and fit it. Returns ``(key, model)``.
+
+    ``base`` is never written to: with process-based backends it arrives as a
+    read-only memory map shared by all workers."""
+    X = base[rows]
+    if extra is not None:
+        X = np.concatenate([X[:, :extra_at], extra, X[:, extra_at:]], axis=1)
+    keep = _prune_low_signal_mask(X)
+    names = [name for name, k in zip(feature_names, keep) if k]
+    if marginal_guards:
+        if not names:
+            return key, float(y.mean())
+        n_pos = int(y.sum())
+        n_neg = int(len(y) - n_pos)
+        if n_pos < n_cv or n_neg < n_cv:
+            return key, float(y.mean())
+    X = np.asfortranarray(X[:, keep], dtype=np.float32)
+    return key, fit_binary_tree_model(X, y, names, max_depths_cv, random_state)
 
 
 def apply_laplace_smoothing(clf, alpha: float = 1.0):
@@ -67,6 +193,18 @@ def apply_laplace_smoothing(clf, alpha: float = 1.0):
             smoothed = (counts + alpha) / (n_total + alpha * n_classes)
             tree_.value[node_id, 0, :] = smoothed
     return clf
+
+
+def train_river_tree(key, model, data, target):
+    """Joblib worker for incremental discovery: feed the rows of ``data`` to
+    the incremental tree ``model`` one by one, in order, and return
+    ``(key, model)``. The trees draw from their own seeded generator, so the
+    result does not depend on where this runs."""
+    for _, row in data.iterrows():
+        X_row = row.drop(target).to_dict()
+        y_row = row[target]
+        model.learn_one(X_row, y_row)
+    return key, model
 
 
 def build_graph_vis(model_t, model_distributions=False):

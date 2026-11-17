@@ -1,8 +1,9 @@
 import pandas as pd
+from joblib import delayed
 from prosit.discovery.resource_discovery import build_training_datasets
-from tqdm import tqdm
 from river import tree
-from prosit.utils.rule_utils import DecisionRules
+from prosit.utils.common_utils import parallel_with_progress
+from prosit.utils.rule_utils import DecisionRules, train_river_tree
 
 
 def incremental_resource_weights_learning(
@@ -36,8 +37,9 @@ def incremental_resource_weights_learning(
     )
 
     models = dict()
+    jobs = []
 
-    for r, data_r in tqdm(datasets.items()):
+    for r, data_r in datasets.items():
         if len(data_r['class'].unique()) < 2:
             models[r] = float(data_r['class'].iloc[0]) if len(data_r) else 0.0
             continue
@@ -50,11 +52,11 @@ def incremental_resource_weights_learning(
         m = tree.HoeffdingAdaptiveTreeClassifier(
             seed=72, max_depth=max_depth, grace_period=grace_period, leaf_prediction="mc"
         )
-        for _, row in data_r.iterrows():
-            X_row = row.drop('class').to_dict()
-            y_row = row['class']
-            m.learn_one(X_row, y_row)
+        jobs.append(delayed(train_river_tree)(r, m, data_r, 'class'))
+        models[r] = None        # keeps the resource order of the datasets
 
+    # The trees are independent: train them in parallel, then build the rules.
+    for r, m in parallel_with_progress(jobs, total=len(jobs), desc='incremental resource models'):
         clf = DecisionRules()
         clf.from_river_decision_tree(m)
         models[r] = clf

@@ -82,7 +82,9 @@ def return_label_data_attributes(log: EventLog) -> tuple:
     import pandas as pd
 
     df_log = pm4py.convert_to_dataframe(log)
-    label_data_attributes = list(set(df_log.columns) - standard_xes_columns)
+    # Sorted, so the attribute (and feature-column) order does not change
+    # from one Python process to the next.
+    label_data_attributes = sorted(set(df_log.columns) - standard_xes_columns, key=str)
 
     # String-typed attributes that parse as numeric for every non-null value
     # (e.g. BPI12's ``case:AMOUNT_REQ`` stored as "20000") are treated as

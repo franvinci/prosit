@@ -1,17 +1,18 @@
 import random
+import warnings
 import pandas as pd
 import heapq
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from tqdm import tqdm
 
 import pm4py
 from pm4py.objects.petri_net.obj import PetriNet, Marking
 from pm4py.objects.log.obj import EventLog
 
-from prosit.discovery.cf_discovery import discover_weight_transitions
-from prosit.discovery.time_discovery import discover_execution_time_distributions, discover_arrival_time, discover_waiting_time
+from prosit.discovery.cf_discovery import discover_weight_transitions, plan_weight_transitions
+from prosit.discovery.time_discovery import discover_execution_time_distributions, discover_arrival_time, discover_waiting_time, plan_execution_time_distributions, plan_waiting_time
 from prosit.discovery.calendar_discovery import discover_res_calendars, discover_arrival_calendar
-from prosit.discovery.resource_discovery import discover_resources_list, return_max_concurrency, discover_resources_per_act, discover_weight_resources
+from prosit.discovery.resource_discovery import discover_resources_list, return_max_concurrency, discover_resources_per_act, discover_weight_resources, plan_weight_resources
 from prosit.discovery.data_discovery import discover_attributes_distribution, return_label_data_attributes
 from prosit.discovery.online_discovery.cf_discovery import incremental_transition_weights_learning
 from prosit.discovery.online_discovery.time_discovery import incremental_execution_time_learning, incremental_model_arrival_learning, incremental_waiting_time_learning
@@ -24,7 +25,11 @@ from prosit.utils.common_utils import (
     is_resource_busy,
     compute_transition_weights_from_model,
     add_minutes_with_calendar,
+    calendar_to_working_set,
     build_df_features,
+    _build_features,
+    dense_take,
+    run_model_plans,
     return_resource,
     compute_resource_weights_from_model,
     )
@@ -32,6 +37,12 @@ from prosit.utils.distribution_utils import sampling_from_dist
 from prosit.utils.save_and_load_utils import decision_rules_to_dict, convert_calendar_names, dict_to_decrules, fromstr_to_scipy
 
 import json
+
+
+def _transition_order(t):
+    """Sort key giving transitions a stable order. They hash by identity, so
+    a set of them iterates in an order that changes with every run."""
+    return (t.name, str(t.label))
 
 
 class SimulatorParameters:
@@ -52,13 +63,16 @@ class SimulatorParameters:
         self.net: PetriNet = net
         self.initial_marking: Marking = initial_marking
         self.final_marking: Marking = final_marking
-        self.net_transition_labels: list = list(set([t.label for t in net.transitions if t.label]))
+        # Sorted: the order of a set of strings changes from one Python process
+        # to the next, and with it the column order of every training matrix
+        # (hence which of two equally good splits a tree picks).
+        self.net_transition_labels: list = sorted(set([t.label for t in net.transitions if t.label]))
 
         self.label_data_attributes: list = []
         self.label_data_attributes_categorical: list = []
         self.attribute_values_label_categorical: dict = dict()
 
-        self.transition_weights: dict = {t.name: 1 for t in list(self.net.transitions)}
+        self.transition_weights: dict = {t.name: 1 for t in sorted(self.net.transitions, key=_transition_order)}
         self.resources: list = ['auto']
         self.act_to_resources: dict = {act: [r for r in self.resources] for act in self.net_transition_labels}
         self.resource_weights: dict = {"auto": 1}
@@ -113,6 +127,14 @@ class SimulatorParameters:
             print("Resources discovery...")
         self.resources = discover_resources_list(log)
         self.act_to_resources = discover_resources_per_act(log, self.net_transition_labels, self.resources)
+        unstaffed = sorted(str(act) for act, act_resources in self.act_to_resources.items() if not act_resources)
+        if unstaffed:
+            warnings.warn(
+                "No resource performs these activities of the model in the log: "
+                + ", ".join(unstaffed)
+                + ". Whenever the model fires one of them it is simulated without a resource.",
+                stacklevel=2,
+            )
 
         if self.label_data_attributes:
             if verbose:
@@ -125,8 +147,16 @@ class SimulatorParameters:
 
         if verbose:
             print("Feature discovery...")
-        df_features = build_df_features(log, self.net, self.initial_marking, self.final_marking, self.act_to_resources, self.net_transition_labels, self.resources, self.label_data_attributes)
-        df_features = df_features[(df_features['resource'].isin(self.resources)) | (df_features["resource"].isna())]
+        # The batch models read the per-candidate workloads / queue lengths from
+        # the dense block; only the incremental learners still walk the
+        # dict-valued ``candidate_*`` columns, so those are built just for them.
+        df_features, dense_candidates = _build_features(
+            log, self.net, self.initial_marking, self.final_marking, self.act_to_resources, self.net_transition_labels, self.resources, self.label_data_attributes,
+            candidate_dicts=incremental_discovery, dense_queue=use_workload_features,
+        )
+        known_resource = (df_features['resource'].isin(self.resources)) | (df_features["resource"].isna())
+        dense_candidates = dense_take(dense_candidates, known_resource.to_numpy())
+        df_features = df_features[known_resource]
         df_features.reset_index(drop=True, inplace=True)
         if enable_multitasking:
             self.max_concurrency = return_max_concurrency(df_features, thr=multitasking_thr)
@@ -150,7 +180,9 @@ class SimulatorParameters:
                                                                     values_categorical=self.attribute_values_label_categorical
                                                                 )
         else:
-            self.transition_weights = discover_weight_transitions(
+            # Batch mode: each step only prepares its fits here; they all run
+            # together further down, in one worker pool.
+            transition_plan = plan_weight_transitions(
                                                                     df_features,
                                                                     self.net_transition_labels,
                                                                     max_depths_cv=max_depth_cv,
@@ -159,9 +191,6 @@ class SimulatorParameters:
                                                                     values_categorical=self.attribute_values_label_categorical,
                                                                     random_state=random_state
                                                                 )
-        for t in self.net.transitions:
-            if t.name not in self.transition_weights:
-                self.transition_weights[t.name] = 0
 
         if verbose:
             if incremental_discovery:
@@ -184,7 +213,7 @@ class SimulatorParameters:
                                                                             use_workload_features=use_workload_features,
                                                                         )
         else:
-            self.resource_weights = discover_weight_resources(
+            resource_plan = plan_weight_resources(
                                                                 df_features,
                                                                 self.act_to_resources,
                                                                 self.resources,
@@ -194,7 +223,8 @@ class SimulatorParameters:
                                                                 self.label_data_attributes_categorical,
                                                                 self.attribute_values_label_categorical,
                                                                 random_state=random_state,
-                                                                use_workload_features=use_workload_features
+                                                                use_workload_features=use_workload_features,
+                                                                _dense=dense_candidates
                                                             )
 
         if verbose:
@@ -230,7 +260,7 @@ class SimulatorParameters:
                                                                                         values_categorical=self.attribute_values_label_categorical
                                                                                     )
         else:
-            self.execution_time_distributions = discover_execution_time_distributions(
+            execution_plan = plan_execution_time_distributions(
                                                                                         df_features,
                                                                                         self.net_transition_labels,
                                                                                         self.resources,
@@ -262,7 +292,7 @@ class SimulatorParameters:
                                                                                     use_workload_features=use_workload_features,
                                                                                 )
         else:
-            self.waiting_time_distributions = discover_waiting_time(
+            waiting_plan = plan_waiting_time(
                                                                         df_features,
                                                                         self.net_transition_labels,
                                                                         self.resources,
@@ -275,6 +305,20 @@ class SimulatorParameters:
                                                                         random_state=random_state,
                                                                         use_workload_features=use_workload_features,
                                                                     )
+
+        if not incremental_discovery:
+            if verbose:
+                print("Model fitting...")
+            (
+                self.transition_weights,
+                self.resource_weights,
+                self.execution_time_distributions,
+                self.waiting_time_distributions,
+            ) = run_model_plans([transition_plan, resource_plan, execution_plan, waiting_plan])
+
+        for t in sorted(self.net.transitions, key=_transition_order):
+            if t.name not in self.transition_weights:
+                self.transition_weights[t.name] = 0
         
         if verbose:
             if incremental_discovery:
@@ -437,12 +481,28 @@ class SimulatorEngine:
 
         if t_start is None:
             t_start = datetime.now()
+        elif isinstance(t_start, pd.Timestamp) and t_start is not pd.NaT:
+            # A Timestamp with no timezone (or UTC) and no nanoseconds moves
+            # exactly like the plain ``datetime`` it wraps: use the latter,
+            # whose arithmetic is several times cheaper. Other Timestamps
+            # (DST zones add elapsed time, not wall time) are left alone.
+            tz = t_start.tzinfo
+            if (tz is None or tz is timezone.utc or str(tz) == 'UTC') and t_start.nanosecond == 0:
+                t_start = t_start.to_pydatetime()
+
+        sim = self.simulation_parameters
+        net = self.net
+        final_marking = self.final_marking
+        rules_mode = sim.rules_mode
+        uwf = sim.use_workload_features
+        mc = sim.max_concurrency
+        calendars = sim.calendars
 
         event_log = []
         enabled_heap = []
-        resource_schedule = {r: [] for r in self.simulation_parameters.resources}
+        resource_schedule = {r: [] for r in sim.resources}
         cases = []
-        firing_sequences = {f"case_{i+1}": [] for i in range(n_traces)}
+        fired = [[] for _ in range(n_traces)]
 
         if not self.simulation_parameters.rules_mode:
             if deterministic_time:
@@ -484,6 +544,43 @@ class SimulatorEngine:
         else:
             x_attr_list = [[] for _ in range(n_traces)]
 
+        # Markings are interned: the enabled transitions of a marking, the
+        # marking reached by a firing and "is this the final marking" are each
+        # computed once per distinct marking instead of once per step. The
+        # enabled transitions are kept sorted by name: the random choice walks
+        # them in order, so a fixed order is what makes a run with a given
+        # seed reproducible.
+        state_of = {}
+        state_markings = []
+        state_enabled = []
+        state_final = []
+        next_state = {}
+        input_places = {}
+
+        def intern(marking):
+            key = frozenset(marking.items())
+            state = state_of.get(key)
+            if state is None:
+                state = state_of[key] = len(state_markings)
+                state_markings.append(marking)
+                state_enabled.append(None)
+                state_final.append(marking == final_marking)
+            return state
+
+        def enabled_in(state):
+            enabled = state_enabled[state]
+            if enabled is None:
+                enabled = state_enabled[state] = tuple(sorted(return_enabled_transitions(net, state_markings[state]), key=_transition_order))
+                for t in enabled:
+                    if t not in input_places:
+                        input_places[t] = [arc.source for arc in t.in_arcs]
+            return enabled
+
+        initial_state = intern(self.initial_marking)
+        no_token_times = {place: None for place in net.places}
+        working_sets = {}
+        arrival_working_set = calendar_to_working_set(sim.arrival_calendar)
+
         current_arr_ts = t_start
 
         for i in range(n_traces):
@@ -520,31 +617,29 @@ class SimulatorEngine:
                 whole_min, frac_sec = divmod(arrival_delta_sec, 60)
                 if whole_min > 0:
                     current_arr_ts = add_minutes_with_calendar(
-                        current_arr_ts, whole_min, self.simulation_parameters.arrival_calendar,
+                        current_arr_ts, whole_min, self.simulation_parameters.arrival_calendar, arrival_working_set,
                     )
                 if frac_sec > 0:
                     current_arr_ts = current_arr_ts + timedelta(seconds=frac_sec)
 
+            # ``features`` (case attributes overlaid with the activity counts)
+            # and ``res_history`` are created when the case takes its first
+            # step and dropped when it completes.
             case = {
-                "case_id": i,
-                "marking": self.initial_marking,
                 "arrival_time": current_arr_ts,
-                "place_token_time": {},
+                "state": initial_state,
+                "place_token_time": dict(no_token_times),
                 "enabled": {},
-                "history": {t: 0 for t in self.simulation_parameters.net_transition_labels},
-                "res_history": {r: 0 for r in self.simulation_parameters.resources},
                 "attributes": trace_attributes,
-                "last_resource": None,
-                "last_activity": None
+                "attribute_values": tuple(x_attr_list[i]),
+                "features": None,
+                "res_history": None,
+                "n_events": 0,
             }
-            for place in self.net.places:
-                case["place_token_time"][place] = None
             case["place_token_time"][list(self.initial_marking.keys())[0]] = case["arrival_time"]
 
-            enabled = return_enabled_transitions(self.net, case["marking"])
-            for t in enabled:
-                input_places = [arc.source for arc in t.in_arcs]
-                enabled_time = max(case["place_token_time"][p] for p in input_places)
+            for t in enabled_in(initial_state):
+                enabled_time = max(case["place_token_time"][p] for p in input_places[t])
                 case["enabled"][t] = enabled_time
 
             if case["enabled"]:
@@ -553,6 +648,8 @@ class SimulatorEngine:
 
             cases.append(case)
 
+        _zero_history = {t: 0 for t in self.simulation_parameters.net_transition_labels}
+        _zero_res_history = {r: 0 for r in self.simulation_parameters.resources}
         _zero_waiting_act = {'waiting_activity = ' + act_label: 0 for act_label in self.simulation_parameters.net_transition_labels}
         _zero_resource_onehot = {'resource = ' + res: 0 for res in self.simulation_parameters.resources}
         _zero_activity_onehot = {'activity = ' + act_label: 0 for act_label in self.simulation_parameters.net_transition_labels}
@@ -566,24 +663,37 @@ class SimulatorEngine:
             if not case["enabled"]:
                 continue
 
+            # Same mapping as ``case attributes | activity history``: the
+            # history counts are kept inside it and updated in place.
+            features = case["features"]
+            if features is None:
+                features = case["features"] = case["attributes"] | _zero_history
+                case["res_history"] = dict(_zero_res_history)
+
             enabled_transitions = list(case["enabled"].keys())
 
-            if not self.simulation_parameters.rules_mode:
+            if not rules_mode:
                 transition_weights = self.simulation_parameters.transition_weights
             else:
-                transition_weights = compute_transition_weights_from_model(self.simulation_parameters.transition_weights, case["attributes"] | case["history"], enabled_transitions)
+                transition_weights = compute_transition_weights_from_model(self.simulation_parameters.transition_weights, features, enabled_transitions)
             chosen_transition = return_fired_transition(transition_weights, enabled_transitions)
             activity = chosen_transition.label
             t_enabled = case["enabled"][chosen_transition]
-            firing_sequences[f"case_{case_id+1}"].append(chosen_transition.name)
+            fired[case_id].append(chosen_transition.name)
 
             if activity is not None:
                 enabled_resources_act = self.simulation_parameters.act_to_resources[activity]
-                uwf = self.simulation_parameters.use_workload_features
-                mc = self.simulation_parameters.max_concurrency
                 if uwf:
-                    workloads = {r: count_concurrent_events(resource_schedule[r], t_enabled) for r in enabled_resources_act}
-                    queue_lengths_cand = {r: sum(1 for s, _ in resource_schedule[r] if s > t_enabled) for r in enabled_resources_act}
+                    workloads = {}
+                    queue_lengths_cand = {}
+                    for r in enabled_resources_act:
+                        schedule = resource_schedule[r]
+                        if schedule:
+                            workloads[r] = count_concurrent_events(schedule, t_enabled)
+                            queue_lengths_cand[r] = sum(1 for s, _ in schedule if s > t_enabled)
+                        else:
+                            workloads[r] = 0
+                            queue_lengths_cand[r] = 0
                     enabled_resources = [r for r in enabled_resources_act if workloads[r] < mc.get(r, 1)]
                 else:
                     workloads = None
@@ -592,17 +702,26 @@ class SimulatorEngine:
                     for r in enabled_resources_act:
                         max_c = mc.get(r, 1)
                         if max_c == 1:
-                            if not is_resource_busy(resource_schedule[r], t_enabled):
+                            schedule = resource_schedule[r]
+                            if not schedule or not is_resource_busy(schedule, t_enabled):
                                 enabled_resources.append(r)
                         else:
                             if count_concurrent_events(resource_schedule[r], t_enabled) < max_c:
                                 enabled_resources.append(r)
-                if not enabled_resources:
+                if not enabled_resources_act:
+                    # The model fires an activity that nobody performs in the
+                    # log: there is no resource to pick, none to wait for and
+                    # no calendar to follow. The event carries no resource,
+                    # starts when it is enabled and lasts what the activity's
+                    # own model says, around the clock.
+                    resource = None
+                    t_enabled_waited = t_enabled
+                elif not enabled_resources:
                     t_enabled_enabled_resources = [resource_schedule[r][-1][-1] if resource_schedule[r] else t_enabled for r in enabled_resources_act]
-                    index_res, t_enabled_waited = min(enumerate(t_enabled_enabled_resources), key=lambda x: x[1])
+                    index_res, t_enabled_waited = min(enumerate(t_enabled_enabled_resources), key=lambda indexed: indexed[1])
                     resource = enabled_resources_act[index_res]
                 else:
-                    if not self.simulation_parameters.rules_mode:
+                    if not rules_mode:
                         resource_weights = {r: self.simulation_parameters.resource_weights.get(r, 0.0) for r in enabled_resources}
                     else:
                         activity_onehot = _zero_activity_onehot.copy()
@@ -624,15 +743,21 @@ class SimulatorEngine:
                             )
                     resource = return_resource(resource_weights, enabled_resources)
                     t_enabled_waited = t_enabled
-                if uwf:
-                    r_workload = workloads[resource]
-                    r_queue_length = queue_lengths_cand[resource]
-                case["res_history"][resource] += 1
+                if resource is not None:
+                    if uwf:
+                        r_workload = workloads[resource]
+                        r_queue_length = queue_lengths_cand[resource]
+                    case["res_history"][resource] += 1
 
-                if sum(case["history"].values()) == 0:
+                    calendar = calendars[resource]
+                    working_set = working_sets.get(resource)
+                    if working_set is None:
+                        working_set = working_sets[resource] = calendar_to_working_set(calendar)
+
+                if case["n_events"] == 0 or resource is None:
                     waiting_time = 0
                 else:
-                    if not self.simulation_parameters.rules_mode:
+                    if not rules_mode:
                         if deterministic_time:
                             waiting_time = sampled_waiting_times[resource]
                             if not isinstance(waiting_time, (int, float)):
@@ -644,9 +769,9 @@ class SimulatorEngine:
                         waiting_activity_features['waiting_activity = ' + activity] = 1
                         time_features = {'hour': t_enabled_waited.hour, 'weekday': t_enabled_waited.weekday()}
                         if uwf:
-                            wt_features = {'workload': r_workload, 'queue_length': r_queue_length} | time_features | waiting_activity_features | case["attributes"] | case["history"]
+                            wt_features = {'workload': r_workload, 'queue_length': r_queue_length} | time_features | waiting_activity_features | features
                         else:
-                            wt_features = time_features | waiting_activity_features | case["attributes"] | case["history"]
+                            wt_features = time_features | waiting_activity_features | features
                         if deterministic_time:
                             waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply(wt_features)
                             if not isinstance(waiting_time, (int, float)):
@@ -654,9 +779,12 @@ class SimulatorEngine:
                         else:
                             waiting_time = self.simulation_parameters.waiting_time_distributions[resource].apply_distribution(wt_features)
 
-                t_start_exec = add_minutes_with_calendar(t_enabled_waited, round(max(0, waiting_time)), self.simulation_parameters.calendars[resource])
+                if resource is None:
+                    t_start_exec = t_enabled_waited
+                else:
+                    t_start_exec = add_minutes_with_calendar(t_enabled_waited, round(max(0, waiting_time)), calendar, working_set)
 
-                if not self.simulation_parameters.rules_mode:
+                if not rules_mode:
                     if deterministic_time:
                         ex_time = sampled_execution_times[activity]
                         if not isinstance(ex_time, (int, float)):
@@ -665,9 +793,10 @@ class SimulatorEngine:
                         ex_time = random.choice(sampled_execution_times[activity])
                 else:
                     resource_onehot = _zero_resource_onehot.copy()
-                    resource_onehot['resource = ' + resource] = 1
+                    if resource is not None:
+                        resource_onehot['resource = ' + resource] = 1
                     ex_time_features = {'hour': t_start_exec.hour, 'weekday': t_start_exec.weekday()}
-                    ex_features = resource_onehot | ex_time_features | case["attributes"] | case["history"]
+                    ex_features = resource_onehot | ex_time_features | features
                     if deterministic_time:
                         ex_time = self.simulation_parameters.execution_time_distributions[activity].apply(ex_features)
                         if not isinstance(ex_time, (int, float)):
@@ -676,34 +805,44 @@ class SimulatorEngine:
                         ex_time = self.simulation_parameters.execution_time_distributions[activity].apply_distribution(ex_features)
 
                 
-                t_end = add_minutes_with_calendar(t_start_exec, round(max(0, ex_time)), self.simulation_parameters.calendars[resource])
+                if resource is None:
+                    t_end = t_start_exec + timedelta(minutes=round(max(0, ex_time)))
+                else:
+                    t_end = add_minutes_with_calendar(t_start_exec, round(max(0, ex_time)), calendar, working_set)
 
-                event_log.append((case_id, activity, resource, t_enabled, t_start_exec, t_end) + tuple(x_attr_list[case_id]))
-                resource_schedule[resource].append((t_start_exec, t_end))
-                case["history"][activity] += 1
-                case["last_resource"] = resource
-                case["last_activity"] = activity
+                event_log.append((case_id, activity, resource, t_enabled, t_start_exec, t_end) + case["attribute_values"])
+                if resource is not None:
+                    resource_schedule[resource].append((t_start_exec, t_end))
+                features[activity] += 1
+                case["n_events"] += 1
                 if len(event_log) % 1000 == 0:
-                    min_enabled = min((min(c["enabled"].values()) for c in cases if c["enabled"]), default=t_end)
+                    # Every case still to be stepped sits in the heap with a key
+                    # no smaller than the one just popped, and no later step
+                    # looks further back than its own key: intervals that ended
+                    # by ``decision_time`` can go.
                     for r in resource_schedule:
-                        resource_schedule[r] = [(s, e) for s, e in resource_schedule[r] if e > min_enabled]
+                        resource_schedule[r] = [(s, e) for s, e in resource_schedule[r] if e > decision_time]
             else:
                 t_end = t_enabled
 
+            token_times = case["place_token_time"]
             for arc in chosen_transition.out_arcs:
-                case["place_token_time"][arc.target] = t_end
+                token_times[arc.target] = t_end
 
             case["enabled"] = {}
-            case["marking"] = update_current_marking(case["marking"], chosen_transition)
-            if case["marking"] == self.final_marking:
+            step = (case["state"], chosen_transition)
+            state = next_state.get(step)
+            if state is None:
+                state = next_state[step] = intern(update_current_marking(state_markings[case["state"]], chosen_transition))
+            case["state"] = state
+            if state_final[state]:
                 if case_id not in completed_cases:
                     pbar.update(1)
                     completed_cases.add(case_id)
+                case["features"] = case["res_history"] = None
                 continue
-            enabled = return_enabled_transitions(self.net, case["marking"])
-            for t in enabled:
-                input_places = [arc.source for arc in t.in_arcs]
-                enabled_time = max(case["place_token_time"][p] for p in input_places)
+            for t in enabled_in(state):
+                enabled_time = max(token_times[p] for p in input_places[t])
                 case["enabled"][t] = enabled_time
 
             if case["enabled"]:
@@ -715,6 +854,6 @@ class SimulatorEngine:
         df_log["case:concept:name"] = df_log["case:concept:name"].apply(lambda x: f"case_{x+1}")
         df_log.sort_values(by=["start:timestamp", "time:timestamp"], inplace=True)
         df_log.reset_index(drop=True, inplace=True)
-        df_log.attrs["prosit_firing_sequences"] = firing_sequences
+        df_log.attrs["prosit_firing_sequences"] = {f"case_{i+1}": fired[i] for i in range(n_traces)}
 
         return df_log

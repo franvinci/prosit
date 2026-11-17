@@ -59,7 +59,7 @@ pip install -e .
 |---|---|---|
 | `pm4py` | 2.4 | Event log parsing, Petri net discovery and conformance |
 | `scikit-learn` | 1.5 | Decision tree models (batch discovery) |
-| `joblib` | 1.2 | Parallel model fitting |
+| `joblib` | 1.4 | Parallel model fitting |
 | `river` | 0.22 | Hoeffding Adaptive Tree (incremental discovery) |
 | `scipy` | 1.14 | Distribution fitting and sampling |
 | `numpy` | 1.26 | Numerical operations |

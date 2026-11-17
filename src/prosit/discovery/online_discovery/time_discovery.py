@@ -4,10 +4,11 @@ from prosit.discovery.time_discovery import (
     build_training_df_arrival,
     build_training_df_wt,
 )
-from tqdm import tqdm
+from joblib import delayed
 import pandas as pd
 from river import tree
-from prosit.utils.rule_utils import DecisionRules
+from prosit.utils.common_utils import parallel_with_progress
+from prosit.utils.rule_utils import DecisionRules, train_river_tree
 
 
 def incremental_model_arrival_learning(
@@ -55,20 +56,25 @@ def incremental_execution_time_learning(
                             )
 
     models_act = dict()
+    slices = {}
+    jobs = []
     
-    for act in tqdm(net_transition_labels):
+    for act in net_transition_labels:
 
         df_act = df[df['activity_executed'] == act].iloc[:,1:]
             
         clf_act = tree.HoeffdingAdaptiveTreeRegressor(seed=72, max_depth=max_depth, grace_period=grace_period, leaf_prediction="mean")
+        slices[act] = df_act
+        jobs.append(delayed(train_river_tree)(act, clf_act, df_act, 'execution_time'))
 
-        for _, row in df_act.iterrows():
-            X_row = row.drop('execution_time').to_dict()
-            y_row = row['execution_time']
-            clf_act.learn_one(X_row, y_row)
-
+    # The trees are independent and are trained in parallel. Turning a tree
+    # into rules samples from numpy's global generator, so that part stays
+    # here, one activity after the other in the original order.
+    trained = dict(parallel_with_progress(jobs, total=len(jobs), desc='incremental exec-time models'))
+    for act in net_transition_labels:
+        df_act = slices[act]
         clf = DecisionRules()
-        clf.from_river_decision_tree(clf_act, distribution=True, min_value=float(df_act['execution_time'].min()), max_value=float(df_act['execution_time'].max()))
+        clf.from_river_decision_tree(trained[act], distribution=True, min_value=float(df_act['execution_time'].min()), max_value=float(df_act['execution_time'].max()))
         models_act[act] = clf
 
     return models_act
@@ -98,18 +104,22 @@ def incremental_waiting_time_learning(
                             )
 
     models_res = dict()
-    for res in tqdm(resources):
+    slices = {}
+    jobs = []
+    for res in resources:
         df_res = df[df['resource'] == res].iloc[:,1:]
 
         clf_res = tree.HoeffdingAdaptiveTreeRegressor(seed=72, max_depth=max_depth, grace_period=grace_period, leaf_prediction="mean")
+        slices[res] = df_res
+        jobs.append(delayed(train_river_tree)(res, clf_res, df_res, 'waiting_time'))
 
-        for _, row in df_res.iterrows():
-            X_row = row.drop('waiting_time').to_dict()
-            y_row = row['waiting_time']
-            clf_res.learn_one(X_row, y_row)
-
+    # Parallel training, rules built here in the original order (see
+    # ``incremental_execution_time_learning``).
+    trained = dict(parallel_with_progress(jobs, total=len(jobs), desc='incremental waiting-time models'))
+    for res in resources:
+        df_res = slices[res]
         clf = DecisionRules()
-        clf.from_river_decision_tree(clf_res, distribution=True, min_value=float(df_res['waiting_time'].min()), max_value=float(df_res['waiting_time'].max()))
+        clf.from_river_decision_tree(trained[res], distribution=True, min_value=float(df_res['waiting_time'].min()), max_value=float(df_res['waiting_time'].max()))
         models_res[res] = clf
 
     return models_res

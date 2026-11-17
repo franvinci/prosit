@@ -1,8 +1,9 @@
 import pandas as pd
+from joblib import delayed
 from prosit.discovery.cf_discovery import build_training_datasets
-from tqdm import tqdm
 from river import tree
-from prosit.utils.rule_utils import DecisionRules
+from prosit.utils.common_utils import parallel_with_progress
+from prosit.utils.rule_utils import DecisionRules, train_river_tree
 
 
 def incremental_transition_weights_learning(
@@ -22,8 +23,9 @@ def incremental_transition_weights_learning(
                                         )
 
     models_t = dict()
+    jobs = []
 
-    for t in tqdm(datasets_t.keys()):
+    for t in datasets_t.keys():
         data_t = datasets_t[t]
         if len(data_t['class'].unique()) < 2:
             models_t[t] = float(data_t['class'].iloc[0]) if len(data_t) else 0.0
@@ -35,12 +37,11 @@ def incremental_transition_weights_learning(
             del data_t[a]
 
         m_t = tree.HoeffdingAdaptiveTreeClassifier(seed=72, max_depth=max_depth, grace_period=grace_period, leaf_prediction="mc")
+        jobs.append(delayed(train_river_tree)(t, m_t, data_t, 'class'))
+        models_t[t] = None      # keeps the transition order of the datasets
 
-        for _, row in data_t.iterrows():
-            X_row = row.drop('class').to_dict()
-            y_row = row['class']
-            m_t.learn_one(X_row, y_row)
-
+    # The trees are independent: train them in parallel, then build the rules.
+    for t, m_t in parallel_with_progress(jobs, total=len(jobs), desc='incremental transition models'):
         clf_t = DecisionRules()
         clf_t.from_river_decision_tree(m_t)
         models_t[t] = clf_t
